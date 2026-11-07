@@ -245,7 +245,7 @@ public class MainActivity extends Activity {
         root.addView(logScroll, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, (int) (130 * dp)));
 
         setContentView(root);
-        log("SD importer v0.2 on " + Build.MANUFACTURER + " " + Build.MODEL + ", Android " + Build.VERSION.RELEASE + " (API " + Build.VERSION.SDK_INT + ")");
+        log("SD importer v0.2.1 on " + Build.MANUFACTURER + " " + Build.MODEL + ", Android " + Build.VERSION.RELEASE + " (API " + Build.VERSION.SDK_INT + ")");
 
         restoreFolders();
         updateStatus();
@@ -598,7 +598,11 @@ public class MainActivity extends Activity {
                 int r;
                 while ((r = in2.read(buf)) > 0) { crc2.update(buf, 0, r); m += r; }
             }
-            if (m != n || crc2.getValue() != crc.getValue()) throw new IOException("verification failed: copy differs from original");
+            if (m != n || crc2.getValue() != crc.getValue()) {
+                String why = diagnose(cr, e.uri, dest, buf, crc.getValue());
+                throw new IOException("verification failed: copy differs from original (wrote " + n + " B crc "
+                        + Long.toHexString(crc.getValue()) + ", read back " + m + " B crc " + Long.toHexString(crc2.getValue()) + "). " + why);
+            }
             String finalName = queryString(cr, dest, DocumentsContract.Document.COLUMN_DISPLAY_NAME);
             if (finalName != null && !finalName.equals(e.name)) log("  note: saved as '" + finalName + "' (name was changed by the system)");
             return dest;
@@ -607,6 +611,43 @@ public class MainActivity extends Activity {
                 try { DocumentsContract.deleteDocument(cr, dest); } catch (Exception ignored) { }
             }
             throw ex;
+        }
+    }
+
+    private static int readFully(InputStream in, byte[] b) throws IOException {
+        int got = 0;
+        while (got < b.length) {
+            int r = in.read(b, got, b.length - got);
+            if (r <= 0) break;
+            got += r;
+        }
+        return got;
+    }
+
+    /** Runs only after a failed check: re-reads the original and the copy and says where and how they differ. */
+    private String diagnose(ContentResolver cr, Uri src, Uri dest, byte[] buf, long firstCrc) {
+        try (InputStream a = cr.openInputStream(src); InputStream b = cr.openInputStream(dest)) {
+            byte[] bb = new byte[buf.length];
+            CRC32 crcA = new CRC32();
+            long off = 0, diffs = 0, first = -1, last = -1, lenA = 0, lenB = 0;
+            while (true) {
+                int ra = readFully(a, buf), rb = readFully(b, bb);
+                crcA.update(buf, 0, ra);
+                lenA += ra;
+                lenB += rb;
+                int mn = Math.min(ra, rb);
+                for (int j = 0; j < mn; j++) {
+                    if (buf[j] != bb[j]) { diffs++; if (first < 0) first = off + j; last = off + j; }
+                }
+                off += mn;
+                if (ra < buf.length || rb < buf.length) break;
+            }
+            return "Diagnosis: second read of original = " + lenA + " B, crc " + Long.toHexString(crcA.getValue())
+                    + (crcA.getValue() == firstCrc ? " (same as first read)" : " (DIFFERENT from first read)")
+                    + "; copy = " + lenB + " B; differing bytes = " + diffs
+                    + (diffs > 0 ? ", first at offset " + first + ", last at offset " + last : "");
+        } catch (Exception ex) {
+            return "Diagnosis failed: " + ex;
         }
     }
 
