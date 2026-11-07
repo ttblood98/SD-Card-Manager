@@ -245,7 +245,7 @@ public class MainActivity extends Activity {
         root.addView(logScroll, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, (int) (130 * dp)));
 
         setContentView(root);
-        log("SD importer v0.2.1 on " + Build.MANUFACTURER + " " + Build.MODEL + ", Android " + Build.VERSION.RELEASE + " (API " + Build.VERSION.SDK_INT + ")");
+        log("SD importer v0.2.2 on " + Build.MANUFACTURER + " " + Build.MODEL + ", Android " + Build.VERSION.RELEASE + " (API " + Build.VERSION.SDK_INT + ")");
 
         restoreFolders();
         updateStatus();
@@ -624,12 +624,22 @@ public class MainActivity extends Activity {
         return got;
     }
 
+    private static String hex(byte[] b, int from, int to, int mark) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = from; i < to; i++) {
+            String h = String.format(Locale.US, "%02x", b[i] & 0xff);
+            sb.append(i == mark ? "[" + h + "]" : h).append(' ');
+        }
+        return sb.toString().trim();
+    }
+
     /** Runs only after a failed check: re-reads the original and the copy and says where and how they differ. */
     private String diagnose(ContentResolver cr, Uri src, Uri dest, byte[] buf, long firstCrc) {
         try (InputStream a = cr.openInputStream(src); InputStream b = cr.openInputStream(dest)) {
             byte[] bb = new byte[buf.length];
             CRC32 crcA = new CRC32();
             long off = 0, diffs = 0, first = -1, last = -1, lenA = 0, lenB = 0;
+            String hexA = "", hexB = "";
             while (true) {
                 int ra = readFully(a, buf), rb = readFully(b, bb);
                 crcA.update(buf, 0, ra);
@@ -637,7 +647,16 @@ public class MainActivity extends Activity {
                 lenB += rb;
                 int mn = Math.min(ra, rb);
                 for (int j = 0; j < mn; j++) {
-                    if (buf[j] != bb[j]) { diffs++; if (first < 0) first = off + j; last = off + j; }
+                    if (buf[j] != bb[j]) {
+                        diffs++;
+                        if (first < 0) {
+                            first = off + j;
+                            int from = Math.max(0, j - 12), to = Math.min(mn, j + 14);
+                            hexA = hex(buf, from, to, j);
+                            hexB = hex(bb, from, to, j);
+                        }
+                        last = off + j;
+                    }
                 }
                 off += mn;
                 if (ra < buf.length || rb < buf.length) break;
@@ -645,7 +664,8 @@ public class MainActivity extends Activity {
             return "Diagnosis: second read of original = " + lenA + " B, crc " + Long.toHexString(crcA.getValue())
                     + (crcA.getValue() == firstCrc ? " (same as first read)" : " (DIFFERENT from first read)")
                     + "; copy = " + lenB + " B; differing bytes = " + diffs
-                    + (diffs > 0 ? ", first at offset " + first + ", last at offset " + last : "");
+                    + (diffs > 0 ? ", first at offset " + first + ", last at offset " + last
+                    + "; bytes around it (the [..] one differs): original " + hexA + " | copy " + hexB : "");
         } catch (Exception ex) {
             return "Diagnosis failed: " + ex;
         }
