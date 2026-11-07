@@ -245,7 +245,7 @@ public class MainActivity extends Activity {
         root.addView(logScroll, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, (int) (130 * dp)));
 
         setContentView(root);
-        log("SD importer v0.2.2 on " + Build.MANUFACTURER + " " + Build.MODEL + ", Android " + Build.VERSION.RELEASE + " (API " + Build.VERSION.SDK_INT + ")");
+        log("SD importer v0.2.3 on " + Build.MANUFACTURER + " " + Build.MODEL + ", Android " + Build.VERSION.RELEASE + " (API " + Build.VERSION.SDK_INT + ")");
 
         restoreFolders();
         updateStatus();
@@ -598,7 +598,14 @@ public class MainActivity extends Activity {
                 int r;
                 while ((r = in2.read(buf)) > 0) { crc2.update(buf, 0, r); m += r; }
             }
-            if (m != n || crc2.getValue() != crc.getValue()) {
+            if (m == n && crc2.getValue() != crc.getValue()) {
+                String tol = redactionTolerance(cr, e.uri, dest, buf);
+                if (tol != null) {
+                    log("  note: " + tol);
+                    m = -1; // handled: fall through to success
+                }
+            }
+            if (m != -1 && (m != n || crc2.getValue() != crc.getValue())) {
                 String why = diagnose(cr, e.uri, dest, buf, crc.getValue());
                 throw new IOException("verification failed: copy differs from original (wrote " + n + " B crc "
                         + Long.toHexString(crc.getValue()) + ", read back " + m + " B crc " + Long.toHexString(crc2.getValue()) + "). " + why);
@@ -611,6 +618,68 @@ public class MainActivity extends Activity {
                 try { DocumentsContract.deleteDocument(cr, dest); } catch (Exception ignored) { }
             }
             throw ex;
+        }
+    }
+
+    /** EXIF location tags that Android blanks when an app reads a photo back (privacy redaction). */
+    private static final String[] GPS_TAGS = {
+            android.media.ExifInterface.TAG_GPS_ALTITUDE, android.media.ExifInterface.TAG_GPS_ALTITUDE_REF,
+            android.media.ExifInterface.TAG_GPS_AREA_INFORMATION, android.media.ExifInterface.TAG_GPS_DOP,
+            android.media.ExifInterface.TAG_GPS_DATESTAMP, android.media.ExifInterface.TAG_GPS_DEST_BEARING,
+            android.media.ExifInterface.TAG_GPS_DEST_BEARING_REF, android.media.ExifInterface.TAG_GPS_DEST_DISTANCE,
+            android.media.ExifInterface.TAG_GPS_DEST_DISTANCE_REF, android.media.ExifInterface.TAG_GPS_DEST_LATITUDE,
+            android.media.ExifInterface.TAG_GPS_DEST_LATITUDE_REF, android.media.ExifInterface.TAG_GPS_DEST_LONGITUDE,
+            android.media.ExifInterface.TAG_GPS_DEST_LONGITUDE_REF, android.media.ExifInterface.TAG_GPS_DIFFERENTIAL,
+            "GPSHPositioningError", android.media.ExifInterface.TAG_GPS_IMG_DIRECTION,
+            android.media.ExifInterface.TAG_GPS_IMG_DIRECTION_REF, android.media.ExifInterface.TAG_GPS_LATITUDE,
+            android.media.ExifInterface.TAG_GPS_LATITUDE_REF, android.media.ExifInterface.TAG_GPS_LONGITUDE,
+            android.media.ExifInterface.TAG_GPS_LONGITUDE_REF, android.media.ExifInterface.TAG_GPS_MAP_DATUM,
+            android.media.ExifInterface.TAG_GPS_MEASURE_MODE, android.media.ExifInterface.TAG_GPS_PROCESSING_METHOD,
+            android.media.ExifInterface.TAG_GPS_SATELLITES, android.media.ExifInterface.TAG_GPS_SPEED,
+            android.media.ExifInterface.TAG_GPS_SPEED_REF, android.media.ExifInterface.TAG_GPS_STATUS,
+            android.media.ExifInterface.TAG_GPS_TIMESTAMP, android.media.ExifInterface.TAG_GPS_TRACK,
+            android.media.ExifInterface.TAG_GPS_TRACK_REF, android.media.ExifInterface.TAG_GPS_VERSION_ID,
+    };
+
+    /**
+     * Called only when the read-back checksum differs. Accepts the copy ONLY if every differing byte lies inside a GPS tag
+     * of the original and reads back as zero (Android's location redaction). Returns a note if accepted, null if not.
+     */
+    private String redactionTolerance(ContentResolver cr, Uri src, Uri dest, byte[] buf) {
+        try {
+            List<long[]> ranges = new ArrayList<>();
+            try (InputStream in = cr.openInputStream(src)) {
+                if (in == null) return null;
+                android.media.ExifInterface ei = new android.media.ExifInterface(in);
+                for (String tag : GPS_TAGS) {
+                    long[] r = ei.getAttributeRange(tag);
+                    if (r != null && r[1] > 0) ranges.add(r);
+                }
+            }
+            if (ranges.isEmpty()) return null;
+            byte[] bb = new byte[buf.length];
+            long off = 0, diffs = 0;
+            try (InputStream a = cr.openInputStream(src); InputStream b = cr.openInputStream(dest)) {
+                if (a == null || b == null) return null;
+                while (true) {
+                    int ra = readFully(a, buf), rb = readFully(b, bb);
+                    if (ra != rb) return null;
+                    for (int j = 0; j < ra; j++) {
+                        if (buf[j] == bb[j]) continue;
+                        long pos = off + j;
+                        boolean inside = false;
+                        for (long[] r : ranges) if (pos >= r[0] && pos < r[0] + r[1]) { inside = true; break; }
+                        if (!inside || bb[j] != 0) return null;
+                        diffs++;
+                    }
+                    off += ra;
+                    if (ra < buf.length) break;
+                }
+            }
+            return diffs + " bytes inside the photo's GPS location tags read back as zero (Android hides location data in "
+                    + "read-back). Everything else matched exactly.";
+        } catch (Throwable t) {
+            return null;
         }
     }
 
