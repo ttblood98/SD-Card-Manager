@@ -65,6 +65,12 @@ small,.small{font-size:12px;color:var(--mut)}
   <button class="sec" id="moveTest">F. Rename/move test</button>
   <button class="sec" id="remember">G. Remembered-folders test</button>
   <div class="small" style="margin-top:6px">G: pick both folders first, then fully close and reopen this page (and try again after unplugging and re-plugging the card), then press G.</div>
+  <hr style="border:0;border-top:1px solid var(--bd)">
+  <div class="small"><b>H. Speed test</b> (Android is slow at listing a card, so this compares other ways in). Pick the SD card folder first for H1.</div>
+  <button class="sec" id="speed">H1. Time listing + date reads (40 files)</button>
+  <label class="chip" style="display:inline-block;margin:3px 3px 3px 0">H2. Plain file picker (select a few photos)<input type="file" id="fpMulti" multiple style="display:none"></label>
+  <label class="chip" style="display:inline-block;margin:3px 3px 3px 0">H3. Folder upload picker (pick the DCIM folder)<input type="file" id="fpDir" webkitdirectory style="display:none"></label>
+  <div class="small" style="margin-top:6px">H2/H3 only read file names, sizes and dates. Nothing is uploaded or changed. For H3, Chrome may show a "Upload N files?" prompt: tap Upload, and note how many seconds it takes to appear.</div>
   <div id="previews"></div>
 </div>
 
@@ -494,6 +500,72 @@ $('#remember').onclick = () => run('remember', async () => {
   }
   rec('remember', Object.assign({ ok: true }, out));
 });
+
+// ---------- H: speed comparison ----------
+// H1: measures the per-call cost of the folder-handle API on a small sample, so we can tell
+// "slow per call" (Android storage layer) from "slow because there are many files".
+$('#speed').onclick = () => run('speedHandle', async () => {
+  if (!srcDir) { log('Pick the SD card folder first', 'warn'); return; }
+  const WANT = 40;
+  const out = { sample: 0 };
+  // find a folder that directly holds files (descend into the first sub-folder, up to 4 levels)
+  let dir = srcDir, hs = [], pathName = srcDir.name, tList = 0, tFirst = null, entries = 0;
+  for (let level = 0; level < 4; level++) {
+    hs = []; let firstSub = null;
+    const t0 = performance.now();
+    for await (const h of dir.values()) {
+      entries++;
+      if (tFirst === null) tFirst = performance.now() - t0;
+      if (h.name.startsWith('.')) continue;
+      if (h.kind === 'file') { hs.push(h); if (hs.length >= WANT) break; }
+      else if (!firstSub) firstSub = h;
+    }
+    tList += performance.now() - t0;
+    if (hs.length || !firstSub) break;
+    dir = firstSub; pathName += '/' + firstSub.name;
+  }
+  out.folder = pathName; out.sample = hs.length; out.listMs = Math.round(tList); out.firstEntryMs = tFirst === null ? null : Math.round(tFirst);
+  out.msPerEntryListing = entries ? Math.round(tList / entries) : null;
+  if (hs.length < 4) { log('Not enough files found to measure (' + hs.length + ')', 'warn'); rec('speedHandle', out); return; }
+  log(`H1 listing: ${entries} entries from "${pathName}" in ${out.listMs} ms (first entry after ${out.firstEntryMs} ms, ~${out.msPerEntryListing} ms each)`, 'ok');
+  const half = Math.floor(hs.length / 2);
+  const seqSet = hs.slice(0, half), parSet = hs.slice(half);
+  let t1 = performance.now();
+  for (const h of seqSet) await h.getFile();
+  out.getFileSeqMsEach = Math.round((performance.now() - t1) / seqSet.length);
+  t1 = performance.now();
+  await Promise.all(parSet.map((h) => h.getFile()));
+  out.getFileParallelMsEach = Math.round((performance.now() - t1) / parSet.length);
+  log(`H1 getFile(): ${out.getFileSeqMsEach} ms each one-at-a-time, ${out.getFileParallelMsEach} ms each when all run at once`, 'ok');
+  rec('speedHandle', Object.assign({ ok: true }, out));
+});
+
+// H2/H3: the browser's ordinary file picker / folder-upload picker. These go through a different
+// Android path than showDirectoryPicker(), and hand back File objects with name/size/date already filled in.
+function wireFilePicker(id, label) {
+  const inp = $(id);
+  let clickAt = 0;
+  inp.addEventListener('click', () => { clickAt = performance.now(); inp.value = ''; });
+  inp.addEventListener('change', () => {
+    const tChange = performance.now();
+    const list = Array.from(inp.files || []);
+    const t0 = performance.now();
+    let withPath = 0, newest = 0, bytes = 0;
+    for (const f of list) { if (f.webkitRelativePath) withPath++; if (f.lastModified > newest) newest = f.lastModified; bytes += f.size; }
+    const tRead = performance.now() - t0;
+    const exts = {};
+    list.forEach((f) => { const i = f.name.lastIndexOf('.'); const e = i > 0 ? f.name.slice(i + 1).toLowerCase() : '(none)'; exts[e] = (exts[e] || 0) + 1; });
+    const out = {
+      ok: list.length > 0, files: list.length, withFolderPath: withPath, readNameSizeDateMs: Math.round(tRead * 10) / 10,
+      clickToChangeMs: Math.round(tChange - clickAt) , byExt: exts, newest: newest ? new Date(newest).toISOString() : null, totalBytes: bytes,
+    };
+    log(`${label}: ${list.length} files; read names/sizes/dates in ${out.readNameSizeDateMs} ms; click to result ${(out.clickToChangeMs / 1000).toFixed(1)} s (includes your time in the picker)`, list.length ? 'ok' : 'warn');
+    if (id === '#fpDir' && list.length && !withPath) log('   No folder paths came back: this browser probably treats the folder picker as a plain file picker.', 'warn');
+    rec(label, out);
+  });
+}
+wireFilePicker('#fpMulti', 'speedFilePicker');
+wireFilePicker('#fpDir', 'speedFolderUpload');
 
 // ---------- report ----------
 $('#copyReport').onclick = async () => {
