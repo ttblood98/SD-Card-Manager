@@ -6,12 +6,26 @@ android {
     namespace 'com.ttblood98.sdcardmanager.speedtest'
     compileSdk 34
 
+    // Signing key comes from the environment (the CI workflow decodes it from GitHub secrets), never from the repo.
+    // Without it the build falls back to a random debug key, which cannot update an app signed with a different key.
+    def ksFile = System.getenv('KEYSTORE_FILE')
+    if (ksFile) {
+        signingConfigs {
+            debug {
+                storeFile file(ksFile)
+                storePassword System.getenv('KEYSTORE_PASSWORD')
+                keyAlias System.getenv('KEY_ALIAS')
+                keyPassword System.getenv('KEY_PASSWORD')
+            }
+        }
+    }
+
     defaultConfig {
         applicationId 'com.ttblood98.sdcardmanager.speedtest'
         minSdk 24
         targetSdk 34
-        versionCode 5
-        versionName '0.2.3'
+        versionCode (System.getenv('GITHUB_RUN_NUMBER') ? System.getenv('GITHUB_RUN_NUMBER').toInteger() + 100 : 1)
+        versionName '0.3.0'
     }
 
     compileOptions {

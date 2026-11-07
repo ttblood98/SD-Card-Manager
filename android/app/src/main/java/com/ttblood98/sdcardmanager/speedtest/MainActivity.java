@@ -245,7 +245,7 @@ public class MainActivity extends Activity {
         root.addView(logScroll, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, (int) (130 * dp)));
 
         setContentView(root);
-        log("SD importer v0.2.3 on " + Build.MANUFACTURER + " " + Build.MODEL + ", Android " + Build.VERSION.RELEASE + " (API " + Build.VERSION.SDK_INT + ")");
+        log("SD importer v" + versionName() + " on " + Build.MANUFACTURER + " " + Build.MODEL + ", Android " + Build.VERSION.RELEASE + " (API " + Build.VERSION.SDK_INT + ")");
 
         restoreFolders();
         updateStatus();
@@ -253,6 +253,14 @@ public class MainActivity extends Activity {
         setButtons();
         if (srcTree != null) startScan();
         else log("Tap 'Card folder' and choose DCIM on the SD card, then 'Destination' for where to put the photos.");
+    }
+
+    private String versionName() {
+        try {
+            return getPackageManager().getPackageInfo(getPackageName(), 0).versionName;
+        } catch (Exception e) {
+            return "?";
+        }
     }
 
     private void setButtons() {
