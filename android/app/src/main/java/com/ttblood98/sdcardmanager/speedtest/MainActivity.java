@@ -89,6 +89,8 @@ public class MainActivity extends Activity {
     private String scanError = null;
     private boolean scannedOnce = false;
     private long lastScan = 0;
+    /** Files deleted or moved since the current scan started; that scan's results must not bring them back. */
+    private final Set<String> removedKeys = new HashSet<>();
 
     private FrameLayout host;
     private final ArrayDeque<Page> pages = new ArrayDeque<>();
@@ -250,6 +252,7 @@ public class MainActivity extends Activity {
         if (scanning || transferring) return;
         scanning = true;
         scanError = null;
+        removedKeys.clear();
         updateChrome();
         final Uri tree = card;
         bg.execute(() -> {
@@ -276,7 +279,7 @@ public class MainActivity extends Activity {
                     Set<String> sel = new HashSet<>();
                     for (Item i : items) if (i.selected) sel.add(i.key());
                     items.clear();
-                    items.addAll(f);
+                    for (Item i : f) if (!removedKeys.contains(i.key())) items.add(i);
                     for (Item i : items) i.selected = sel.contains(i.key());
                     thumbs.forgetFailures();
                     long bytes = 0;
@@ -1184,13 +1187,20 @@ public class MainActivity extends Activity {
         if (morph == null) {
             float rel = cum / pinchBase;
             int dir = rel > 1.05f ? -1 : rel < 0.95f ? +1 : 0;  // -1 = fewer columns
-            if (dir == 0 || (pinchDir != 0 && dir != pinchDir)) return;
+            if (dir == 0) return;
             pinchDir = dir;
             pinchBase = cum;
             if (!startMorph(dir, fx, fy)) return;
         }
         if (morph.to == null) return;
         float p = morphProgress(cum / pinchBase);
+        if (p < -0.03f) {  // came back past this step's start: aim the other way instead (no visible change at the start)
+            int other = morph.from.cols - pinchDir;
+            if (other >= 2 && other <= 7 && morph.target(other, fx, fy)) {
+                pinchDir = -pinchDir;
+                p = morphProgress(cum / pinchBase);
+            }
+        }
         if (p > 1.12f) {  // kept going past the target: make it the new start and aim one more step
             int next = morph.to.cols + pinchDir;
             if (next >= 2 && next <= 7) {
@@ -1356,6 +1366,7 @@ public class MainActivity extends Activity {
                 getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
                 covers.invalidateAll();
                 if (!r.moved.isEmpty()) items.removeAll(r.moved);
+                for (Item e : r.moved) removedKeys.add(e.key());
                 for (Item e : todo) e.selected = false;
                 applyFilter();
                 showResult(r, move, dest);
@@ -1562,6 +1573,62 @@ public class MainActivity extends Activity {
         d.getButton(AlertDialog.BUTTON_POSITIVE).setTextColor(ui.danger);
     }
 
+    /** The other half of a RAW+JPEG pair: same name, same folder, the other type. */
+    Item partnerOf(Item e) {
+        if (e.type == Item.T_OTHER) return null;
+        String base = baseName(e.name), dir = parentId(e);
+        for (Item o : items) {
+            if (o == e || o.type == Item.T_OTHER || o.type == e.type) continue;
+            if (baseName(o.name).equals(base) && parentId(o).equals(dir)) return o;
+        }
+        return null;
+    }
+
+    private static String baseName(String n) {
+        int i = n.lastIndexOf('.');
+        return (i > 0 ? n.substring(0, i) : n).toLowerCase(Locale.ROOT);
+    }
+
+    private static String parentId(Item e) {
+        String id = android.provider.DocumentsContract.getDocumentId(e.uri);
+        int i = id.lastIndexOf('/');
+        return i >= 0 ? id.substring(0, i) : "";
+    }
+
+    /** Delete one photo (from the viewer), offering to delete its RAW/JPEG partner too (ticked by default). */
+    void confirmDeleteOne(final Item e) {
+        if (transferring) return;
+        final Item partner = partnerOf(e);
+        LinearLayout box = ui.vbox();
+        box.setPadding(ui.px(24), ui.px(8), ui.px(24), 0);
+        TextView msg = ui.text(Item.TYPE_NAMES[e.type] + " \u00B7 " + Ui.fmtSize(e.size)
+                + "\n\nThis permanently deletes it from the SD card. It can't be undone.", 15, ui.textDim, false);
+        box.addView(msg);
+        final android.widget.CheckBox also = new android.widget.CheckBox(this);
+        if (partner != null) {
+            also.setText("Also delete the matching " + (partner.type == Item.T_RAW ? "RAW" : "JPEG") + ": "
+                    + partner.name + " (" + Ui.fmtSize(partner.size) + ")");
+            also.setTextColor(ui.text);
+            also.setChecked(true);
+            LinearLayout.LayoutParams cp = Ui.lp(Ui.MATCH, Ui.WRAP);
+            cp.setMargins(0, ui.px(12), 0, 0);
+            box.addView(also, cp);
+        }
+        AlertDialog d = new AlertDialog.Builder(this)
+                .setTitle("Delete " + e.name + "?")
+                .setView(box)
+                .setPositiveButton("Delete", (dd, w) -> {
+                    List<Item> todo = new ArrayList<>();
+                    todo.add(e);
+                    if (partner != null && also.isChecked()) todo.add(partner);
+                    beginDelete(todo);
+                })
+                .setNegativeButton("Cancel", null)
+                .create();
+        d.show();
+        d.getButton(AlertDialog.BUTTON_POSITIVE).setTextColor(ui.danger);
+    }
+
     private void beginDelete(final List<Item> todo) {
         if (transferring) return;
         transferring = true;
@@ -1601,6 +1668,7 @@ public class MainActivity extends Activity {
                 deleting = false;
                 thumbs.paused = false;
                 items.removeAll(gone);
+                for (Item e : gone) removedKeys.add(e.key());
                 for (Item e : todo) e.selected = false;
                 applyFilter();
                 refreshPages();

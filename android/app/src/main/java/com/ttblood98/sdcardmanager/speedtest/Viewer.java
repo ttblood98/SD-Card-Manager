@@ -75,11 +75,8 @@ final class Viewer implements MainActivity.Page {
         trash.setContentDescription("Delete this photo");
         trash.setBackground(ui.ripple(null, 0x33FFFFFF));
         trash.setOnClickListener(v -> {
-            if (index >= 0 && index < a.shown.size()) {
-                java.util.List<Item> one = new java.util.ArrayList<>();
-                one.add(a.shown.get(index));
-                a.confirmDelete(one);
-            }
+            Item e = currentItem();
+            if (e != null) a.confirmDeleteOne(e);
         });
         top.addView(trash, new LinearLayout.LayoutParams(ui.px(48), ui.px(48)));
         selBtn = ui.text("", 14, 0xFFFFFFFF, true);
@@ -295,8 +292,20 @@ final class Viewer implements MainActivity.Page {
         selBtn.setTextColor(e.selected ? ui.onAccent : 0xFFFFFFFF);
     }
 
-    private void toggleSelect() {
+    /**
+     * The photo actually on screen. If a swipe is still settling, it is finished first: the index only moves to the
+     * new photo when the slide ends, so acting before that would hit the previous photo.
+     */
+    private Item currentItem() {
+        if (settleAnim != null && settleAnim.isRunning()) settleAnim.end();
+        if (paging || index < 0 || index >= a.shown.size()) return null;
         Item e = a.shown.get(index);
+        return e.key().equals(slots[1].getTag()) ? e : null;
+    }
+
+    private void toggleSelect() {
+        Item e = currentItem();
+        if (e == null) return;
         e.selected = !e.selected;
         updateSel();
         a.onSelectionChanged();
