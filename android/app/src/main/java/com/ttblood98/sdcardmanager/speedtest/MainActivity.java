@@ -2,7 +2,6 @@ package com.ttblood98.sdcardmanager.speedtest;
 
 import android.app.Activity;
 import android.app.AlertDialog;
-import android.app.DatePickerDialog;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Context;
@@ -51,7 +50,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * SD Importer: a gallery of the camera card. Tap to view, long-press (and drag) to select, then Copy or Move to a
+ * Offload: a gallery of the camera card. Tap to view, long-press (and drag) to select, then Copy or Move to a
  * destination chosen in the in-app folder picker. Settings hold the one-time setup (card folder, destination folders).
  */
 public class MainActivity extends Activity {
@@ -127,7 +126,7 @@ public class MainActivity extends Activity {
         host.addView(buildGallery(), new FrameLayout.LayoutParams(Ui.MATCH, Ui.MATCH));
         setContentView(host);
 
-        log("SD Importer v" + versionName() + " on " + Build.MANUFACTURER + " " + Build.MODEL + ", Android "
+        log("Offload v" + versionName() + " on " + Build.MANUFACTURER + " " + Build.MODEL + ", Android "
                 + Build.VERSION.RELEASE + " (API " + Build.VERSION.SDK_INT + ")");
         card = prefs.card();
         log("Remembered folders: card " + (card != null ? "yes" : "no") + ", destinations " + prefs.roots().size());
@@ -424,25 +423,16 @@ public class MainActivity extends Activity {
     }
 
     private void pickCustomRange() {
-        final Calendar now = Calendar.getInstance();
-        DatePickerDialog first = new DatePickerDialog(this, (v1, y1, m1, d1) -> {
-            final Calendar from = Calendar.getInstance();
-            from.set(y1, m1, d1);
-            startOfDay(from);
-            DatePickerDialog second = new DatePickerDialog(this, (v2, y2, m2, d2) -> {
-                Calendar to = Calendar.getInstance();
-                to.set(y2, m2, d2);
-                startOfDay(to);
-                to.add(Calendar.DAY_OF_YEAR, 1);
-                to.add(Calendar.MILLISECOND, -1);
-                SimpleDateFormat f = new SimpleDateFormat("MMM d", Locale.getDefault());
-                setRange(from.getTimeInMillis(), to.getTimeInMillis(), f.format(from.getTime()) + " - " + f.format(to.getTime()));
-            }, y1, m1, d1);
-            second.setTitle("To");
-            second.show();
-        }, now.get(Calendar.YEAR), now.get(Calendar.MONTH), now.get(Calendar.DAY_OF_MONTH));
-        first.setTitle("From");
-        first.show();
+        Set<Integer> days = new HashSet<>();
+        long newest = 0;
+        Calendar c = Calendar.getInstance();
+        for (Item e : items) {
+            if (!types[e.type]) continue;
+            c.setTimeInMillis(e.mtime);
+            days.add(DateRangeDialog.ymd(c));
+            newest = Math.max(newest, e.mtime);
+        }
+        new DateRangeDialog(this, days, newest, this::setRange).show();
     }
 
     private void setRange(long from, long to, String label) {
@@ -507,7 +497,7 @@ public class MainActivity extends Activity {
 
         LinearLayout bar = ui.topBar();
         closeSel = ui.iconButton("✕", "Clear selection", v -> clearSelection());
-        title = ui.text("SD Importer", 20, ui.text, true);
+        title = ui.text("Offload", 20, ui.text, true);
         subtitle = ui.text("", 13, ui.textDim, false);
         selAllBtn = ui.flatButton("Select all", v -> selectAllShown());
         sortBtn = ui.iconButton("⇅", "Sort", v -> chooseSort());
@@ -563,8 +553,13 @@ public class MainActivity extends Activity {
         bottomBar.setBackgroundColor(ui.surface);
         bottomBar.setElevation(ui.px(8));
         bottomBar.setPadding(ui.px(12), ui.px(10), ui.px(12), ui.px(10));
-        TextView delBtn = ui.secondaryButton("🗑 Delete", v -> confirmDelete(selectedItems()));
+        TextView delBtn = ui.secondaryButton("Delete", v -> confirmDelete(selectedItems()));
         delBtn.setTextColor(ui.danger);
+        android.graphics.drawable.Drawable trash = trashIcon(ui.danger, 18);
+        if (trash != null) {
+            delBtn.setCompoundDrawablesRelative(trash, null, null, null);
+            delBtn.setCompoundDrawablePadding(ui.px(6));
+        }
         TextView copyBtn = ui.secondaryButton("Copy", v -> startTransferFlow(false));
         TextView moveBtn = ui.primaryButton("Move", v -> startTransferFlow(true));
         bottomBar.addView(delBtn, Ui.weight(1.15f));
@@ -594,7 +589,7 @@ public class MainActivity extends Activity {
             title.setText(n + " selected");
             subtitle.setText(Ui.fmtSize(selBytes));
         } else {
-            title.setText("SD Importer");
+            title.setText("Offload");
             if (scanning && items.isEmpty()) subtitle.setText("Reading card…");
             else if (card == null) subtitle.setText("No card folder yet");
             else if (shown.size() == items.size()) subtitle.setText(items.size() + " files · " + Ui.fmtSize(shownBytes));
@@ -613,7 +608,7 @@ public class MainActivity extends Activity {
         String head = null, body = null;
         List<View> buttons = new ArrayList<>();
         if (card == null) {
-            head = prefs.cardWasSet() ? "Card folder access was lost" : "Welcome to SD Importer";
+            head = prefs.cardWasSet() ? "Card folder access was lost" : "Welcome to Offload";
             body = "Choose the DCIM folder on your camera's SD card. You only need to do this once; it is remembered.";
             buttons.add(ui.primaryButton("Choose card folder", v -> pickCard()));
         } else if (scanError != null) {
@@ -848,9 +843,9 @@ public class MainActivity extends Activity {
 
                 @Override public boolean onScale(android.view.ScaleGestureDetector d) {
                     pinchAcc *= d.getScaleFactor();
-                    // spreading fingers = more (smaller) thumbnails; pinching = fewer (bigger)
-                    if (pinchAcc > 1.3f) { changeColumns(+1); pinchAcc = 1f; }
-                    else if (pinchAcc < 0.77f) { changeColumns(-1); pinchAcc = 1f; }
+                    // spreading fingers = zoom in = fewer, bigger thumbnails; pinching = more, smaller
+                    if (pinchAcc > 1.3f) { changeColumns(-1, d.getFocusX(), d.getFocusY()); pinchAcc = 1f; }
+                    else if (pinchAcc < 0.77f) { changeColumns(+1, d.getFocusX(), d.getFocusY()); pinchAcc = 1f; }
                     return true;
                 }
 
@@ -960,8 +955,10 @@ public class MainActivity extends Activity {
         }
     }
 
-    /** Pinch on the gallery: +1 = more columns (smaller thumbnails), -1 = fewer. Keeps the same photos in view. */
-    private void changeColumns(int delta) {
+    private ImageView gridSnapshot;
+
+    /** Pinch on the gallery: +1 = more columns (smaller thumbnails), -1 = fewer. Cross-fades old and new grid. */
+    private void changeColumns(int delta, float fx, float fy) {
         int cols = prefs.columns(), n = Math.max(2, Math.min(7, cols + delta));
         if (n == cols) return;
         int firstItem = -1;
@@ -971,6 +968,27 @@ public class MainActivity extends Activity {
             if (r instanceof TileRow) firstItem = ((TileRow) r).start;
             else if (r instanceof Header) firstItem = ((Header) r).start;
         }
+
+        // freeze the current grid as a picture laid over the list
+        FrameLayout parent = (FrameLayout) list.getParent();
+        if (gridSnapshot != null) { gridSnapshot.animate().cancel(); parent.removeView(gridSnapshot); gridSnapshot = null; }
+        list.animate().cancel();
+        if (list.getWidth() > 0 && list.getHeight() > 0) {
+            try {
+                android.graphics.Bitmap snap = android.graphics.Bitmap.createBitmap(list.getWidth(), list.getHeight(),
+                        android.graphics.Bitmap.Config.ARGB_8888);
+                android.graphics.Canvas cv = new android.graphics.Canvas(snap);
+                cv.drawColor(ui.bg);
+                list.setAlpha(1f);
+                list.setScaleX(1f);
+                list.setScaleY(1f);
+                list.draw(cv);
+                gridSnapshot = new ImageView(this);
+                gridSnapshot.setImageBitmap(snap);
+                parent.addView(gridSnapshot, 1, new FrameLayout.LayoutParams(Ui.MATCH, Ui.MATCH));
+            } catch (Throwable ignored) { gridSnapshot = null; }
+        }
+
         prefs.setColumns(n);
         rebuildRows();
         adapter.notifyDataSetChanged();
@@ -980,6 +998,27 @@ public class MainActivity extends Activity {
                 if (r instanceof TileRow && ((TileRow) r).start + ((TileRow) r).count > firstItem) { list.setSelection(i); break; }
             }
         }
+
+        // old grid grows/shrinks and fades out while the new one settles in from the opposite size
+        float ratio = cols / (float) n;  // > 1 when thumbnails get bigger
+        final ImageView snapView = gridSnapshot;
+        if (snapView != null) {
+            snapView.setPivotX(fx);
+            snapView.setPivotY(fy);
+            snapView.animate().alpha(0f).scaleX(ratio).scaleY(ratio).setDuration(260)
+                    .setInterpolator(new android.view.animation.DecelerateInterpolator())
+                    .withEndAction(() -> {
+                        parent.removeView(snapView);
+                        if (gridSnapshot == snapView) gridSnapshot = null;
+                    }).start();
+        }
+        list.setPivotX(fx);
+        list.setPivotY(fy);
+        list.setAlpha(0f);
+        list.setScaleX(1f / ratio);
+        list.setScaleY(1f / ratio);
+        list.animate().alpha(1f).scaleX(1f).scaleY(1f).setDuration(260)
+                .setInterpolator(new android.view.animation.DecelerateInterpolator()).start();
         list.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK);
     }
 
@@ -1235,6 +1274,18 @@ public class MainActivity extends Activity {
 
     // ================================================================== delete
 
+    /** The flat trash-can vector icon, tinted and sized (dp). */
+    android.graphics.drawable.Drawable trashIcon(int color, int sizeDp) {
+        int id = getResources().getIdentifier("ic_trash", "drawable", getPackageName());
+        if (id == 0) return null;
+        android.graphics.drawable.Drawable d = getDrawable(id);
+        if (d == null) return null;
+        d = d.mutate();
+        d.setTint(color);
+        d.setBounds(0, 0, ui.px(sizeDp), ui.px(sizeDp));
+        return d;
+    }
+
     /** Asks before permanently deleting files from the card. */
     void confirmDelete(final List<Item> todo) {
         if (todo.isEmpty() || transferring) return;
@@ -1440,7 +1491,7 @@ public class MainActivity extends Activity {
             c5.addView(ui.listRow("🖼", "Thumbnail stats", thumbs.stats(), null, v -> refresh()));
             body.addView(c5);
 
-            TextView about = ui.text("SD Importer " + versionName(), 13, ui.textDim, false);
+            TextView about = ui.text("Offload " + versionName(), 13, ui.textDim, false);
             about.setGravity(Gravity.CENTER);
             about.setPadding(0, ui.px(24), 0, ui.px(32));
             body.addView(about, Ui.lp(Ui.MATCH, Ui.WRAP));
@@ -1477,7 +1528,7 @@ public class MainActivity extends Activity {
         ClipboardManager cm = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
         String text;
         synchronized (report) { text = report.toString(); }
-        cm.setPrimaryClip(ClipData.newPlainText("SD Importer report", text));
+        cm.setPrimaryClip(ClipData.newPlainText("Offload report", text));
         Toast.makeText(this, "Report copied", Toast.LENGTH_SHORT).show();
     }
 

@@ -68,14 +68,20 @@ final class Viewer implements MainActivity.Page {
         tcol.addView(title);
         tcol.addView(counter);
         top.addView(tcol, Ui.weight(1));
-        TextView trash = ui.iconButton("🗑", "Delete this photo", v -> {
+        android.widget.ImageView trash = new android.widget.ImageView(a);
+        android.graphics.drawable.Drawable ti = a.trashIcon(0xFFFFFFFF, 24);
+        if (ti != null) trash.setImageDrawable(ti);
+        trash.setScaleType(android.widget.ImageView.ScaleType.CENTER);
+        trash.setContentDescription("Delete this photo");
+        trash.setBackground(ui.ripple(null, 0x33FFFFFF));
+        trash.setOnClickListener(v -> {
             if (index >= 0 && index < a.shown.size()) {
                 java.util.List<Item> one = new java.util.ArrayList<>();
                 one.add(a.shown.get(index));
                 a.confirmDelete(one);
             }
         });
-        top.addView(trash);
+        top.addView(trash, new LinearLayout.LayoutParams(ui.px(48), ui.px(48)));
         selBtn = ui.text("", 14, 0xFFFFFFFF, true);
         selBtn.setGravity(Gravity.CENTER);
         selBtn.setPadding(ui.px(14), ui.px(8), ui.px(14), ui.px(8));
@@ -261,10 +267,8 @@ final class Viewer implements MainActivity.Page {
         Item e = a.shown.get(index);
         title.setText(e.name);
         counter.setText((index + 1) + " of " + a.shown.size());
-        info.setText(Item.TYPE_NAMES[e.type] + " · " + Ui.fmtSize(e.size) + " · "
-                + new SimpleDateFormat("EEE, MMM d, yyyy  HH:mm", Locale.getDefault()).format(new Date(e.mtime)));
-        String d = a.thumbs.cachedDetails(e);
-        details.setText(d != null ? d : "");
+        info.setText(new SimpleDateFormat("EEEE, MMMM d, yyyy  ·  h:mm a", Locale.getDefault()).format(new Date(e.mtime)));
+        details.setText(compose(e, a.thumbs.cachedDetails(e)));
         updateSel();
         fetchDetails(index, true);
         fetchDetails(index + 1, false);
@@ -279,7 +283,7 @@ final class Viewer implements MainActivity.Page {
             String s = readDetails(e);
             a.h.post(() -> {
                 a.thumbs.putDetails(e, s);
-                if (index >= 0 && index < a.shown.size() && a.shown.get(index) == e) details.setText(s);
+                if (index >= 0 && index < a.shown.size() && a.shown.get(index) == e) details.setText(compose(e, s));
             });
         });
     }
@@ -300,7 +304,18 @@ final class Viewer implements MainActivity.Page {
 
     // ---------------------------------------------------------------- details
 
-    /** Resolution, camera + lens, and exposure, read from the file. Runs on a background thread. */
+    private static final String DOT = "  ·  ";
+
+    /** Line 1: type, size, resolution. Line 2: camera and lens. Line 3: exposure. Shown even before details load. */
+    private static String compose(Item e, String det) {
+        String[] p = det == null ? new String[]{"", "", ""} : det.split("\n", -1);
+        StringBuilder sb = new StringBuilder(Item.TYPE_NAMES[e.type]).append(DOT).append(Ui.fmtSize(e.size));
+        if (p.length > 0 && !p[0].isEmpty()) sb.append(DOT).append(p[0]);
+        for (int i = 1; i < p.length; i++) if (!p[i].isEmpty()) sb.append('\n').append(p[i]);
+        return sb.toString();
+    }
+
+    /** "resolution \n camera + lens \n exposure" read from the file (parts may be empty). Background thread. */
     private String readDetails(Item e) {
         StringBuilder sb = new StringBuilder();
         android.media.ExifInterface x = null;
@@ -331,9 +346,9 @@ final class Viewer implements MainActivity.Page {
             if (orient == 6 || orient == 8) { int t = w; w = h; h = t; }
         }
         if (w > 0 && h > 0) {
-            sb.append(w).append(" × ").append(h).append(String.format(Locale.US, "  ·  %.1f MP", w * (double) h / 1e6));
+            sb.append(w).append(" × ").append(h).append(DOT).append(String.format(Locale.US, "%.1f MP", w * (double) h / 1e6));
         }
-        if (x == null) return sb.toString();
+        if (x == null) return sb + "\n\n";
 
         String make = x.getAttribute(android.media.ExifInterface.TAG_MAKE);
         String model = x.getAttribute(android.media.ExifInterface.TAG_MODEL);
@@ -346,21 +361,19 @@ final class Viewer implements MainActivity.Page {
             cam.append(m);
         }
         String lens = x.getAttribute("LensModel");
-        if (lens != null && !lens.trim().isEmpty()) cam.append(cam.length() > 0 ? "  ·  " : "").append(lens.trim());
-        if (cam.length() > 0) sb.append(sb.length() > 0 ? "\n" : "").append(cam);
+        if (lens != null && !lens.trim().isEmpty()) cam.append(cam.length() > 0 ? DOT : "").append(lens.trim());
 
         StringBuilder exp = new StringBuilder();
         double fl = x.getAttributeDouble(android.media.ExifInterface.TAG_FOCAL_LENGTH, 0);
         if (fl > 0) exp.append(Math.round(fl)).append(" mm");
         double fn = x.getAttributeDouble(android.media.ExifInterface.TAG_F_NUMBER, 0);
-        if (fn > 0) exp.append(exp.length() > 0 ? "   " : "").append(String.format(Locale.US, "f/%.1f", fn));
+        if (fn > 0) exp.append(exp.length() > 0 ? DOT : "").append(String.format(Locale.US, "f/%.1f", fn));
         double t = x.getAttributeDouble(android.media.ExifInterface.TAG_EXPOSURE_TIME, 0);
-        if (t > 0) exp.append(exp.length() > 0 ? "   " : "")
+        if (t > 0) exp.append(exp.length() > 0 ? DOT : "")
                 .append(t >= 1 ? String.format(Locale.US, "%.1f s", t) : "1/" + Math.round(1 / t) + " s");
         String iso = x.getAttribute("ISOSpeedRatings");
         if (iso == null) iso = x.getAttribute("PhotographicSensitivity");
-        if (iso != null) exp.append(exp.length() > 0 ? "   " : "").append("ISO ").append(iso);
-        if (exp.length() > 0) sb.append(sb.length() > 0 ? "\n" : "").append(exp);
-        return sb.toString();
+        if (iso != null) exp.append(exp.length() > 0 ? DOT : "").append("ISO ").append(iso);
+        return sb + "\n" + cam + "\n" + exp;
     }
 }

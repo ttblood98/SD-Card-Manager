@@ -16,13 +16,15 @@ Open the GitHub Pages URL in **Chrome or Edge** (phone and PC):
 
 The test never touches your photos; it only deletes its own copies and one temp file it creates on the card.
 
-## Android app (SD Importer)
+## Android app: Offload
 
 The `android/` folder holds a native Android app. It replaced the web page on Android, where folder access is far
 too slow (a native scan of 580 files takes about 0.1 s; the browser took about 2 minutes).
 
 - **Gallery:** browse the card grouped by day, filter by type (RAW / JPEG / other) and date (dropdown), sort (top bar).
-  Pinch to change the grid: spread fingers for more, smaller thumbnails; pinch for fewer, bigger ones.
+  Pinch to change the grid: spread fingers for fewer, bigger thumbnails; pinch for more, smaller ones.
+  "Other" (non-photo) files are hidden until you turn that filter on. "Pick dates" opens a calendar where you tap
+  the first and last day; dots mark days with photos.
 - **Viewer:** swipe between photos, pinch or double-tap to zoom, see resolution, camera, lens and exposure.
 - **Selecting:** tap a photo to view it full screen; long-press to start selecting, and keep your finger down and drag
   to select a range (the list scrolls at the edges). Each day has a Select button.
@@ -34,4 +36,4 @@ too slow (a native scan of 580 files takes about 0.1 s; the browser took about 2
   grid size, activity log.
 
 Builds come from GitHub Actions (`.github/workflows/android-apk.yml`); download the `SDImporter-apk` artifact from a
-run. Builds are signed with the key in the repository secrets, so new versions install over old ones.
+run (the app is called Offload). Builds are signed with the key in the repository secrets, so new versions install over old ones.
