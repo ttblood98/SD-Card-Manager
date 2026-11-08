@@ -325,7 +325,10 @@ public class MainActivity extends Activity {
 
     private void rebuildRows() {
         rows.clear();
-        int cols = cols();
+        buildRows(cols(), rows);
+    }
+
+    private void buildRows(int cols, List<Object> rows) {
         boolean group = sort == 0 || sort == 1;
         int i = 0;
         while (i < shown.size()) {
@@ -682,7 +685,8 @@ public class MainActivity extends Activity {
                 HeaderHolder hh;
                 if (convert == null) {
                     LinearLayout row = ui.hbox();
-                    row.setPadding(ui.px(16), ui.px(14), ui.px(8), ui.px(6));
+                    row.setPadding(ui.px(16), ui.px(8), ui.px(8), 0);
+                    row.setLayoutParams(new AbsListView.LayoutParams(Ui.MATCH, headerHeight()));
                     hh = new HeaderHolder();
                     hh.label = ui.text("", 15, ui.text, true);
                     hh.count = ui.text("", 13, ui.textDim, false);
@@ -962,129 +966,194 @@ public class MainActivity extends Activity {
         }
     }
 
-    // ---- pinch-to-resize, following the fingers.
-    // The current grid is frozen as a picture on top; the new column count is laid out underneath at full opacity.
-    // Both scale exactly with the fingers; the picture fades out over a short stretch in the middle, so one grid
-    // replaces the other instead of the two blending. Direction is locked per pinch so finger jitter can't flip it.
+    // ---- pinch-to-resize. While pinching, an overlay draws every visible thumbnail gliding from its place in the
+    // old grid to its place in the new one, in step with the fingers (the photo under the fingers stays under them).
+    // The real grid is only swapped when the fingers lift, already lined up with where the photos ended up.
     // Spreading = fewer, bigger thumbnails; pinching = more, smaller. Release past halfway to keep the change.
 
-    private ImageView gridSnapshot;
-    private android.graphics.Bitmap snapBitmap;
-    private int pinchFrom = 0, pinchTo = 0, pinchFirstItem = -1, pinchDir = 0;
-    private float pinchBase = 1f, pinchEff = 1f, pinchFx, pinchFy;
-    private android.animation.ValueAnimator pinchAnim;
+    int headerHeight() { return ui.px(48); }
 
-    private void pinchBegin() {
-        if (pinchAnim != null) pinchAnim.end();
-        pinchBase = 1f;
-        pinchTo = 0;
-        pinchDir = 0;
-        pinchEff = 1f;
-    }
+    /** Where every row, photo and day header sits for a given column count (absolute y, from the top of the list). */
+    private final class GridGeom {
+        final int cols, tile, width;
+        final List<Object> rows = new ArrayList<>();
+        final int[] rowY, itemY, itemCol;
+        final List<Header> headers = new ArrayList<>();
+        final List<Integer> headerY = new ArrayList<>();
+        final int total;
 
-    private float pinchRatio() { return pinchFrom / (float) pinchTo; }  // > 1 when thumbnails get bigger
-
-    private float pinchProgress(float eff) {
-        float ratio = pinchRatio();
-        float p = ratio > 1 ? (eff - 1f) / (ratio - 1f) : (1f - eff) / (1f - ratio);
-        return Math.max(0f, Math.min(1f, p));
-    }
-
-    private void pinchUpdate(float cum, float fx, float fy) {
-        if (pinchTo == 0) {
-            pinchFx = fx;
-            pinchFy = fy;
-            float rel = cum / pinchBase;
-            int dir = rel > 1.06f ? -1 : rel < 0.94f ? +1 : 0;  // -1 = fewer columns
-            if (dir == 0 || (pinchDir != 0 && dir != pinchDir)) return;
-            pinchDir = dir;
-            pinchBase = cum;  // the frozen grid starts at exactly its current size: no jump
-            startPinchStep(dir);
-            if (pinchTo == 0) return;
-        }
-        float eff = cum / pinchBase;
-        setPinchEff(eff);
-        float ratio = pinchRatio();
-        boolean beyond = ratio > 1 ? eff > ratio * 1.1f : eff < ratio / 1.1f;
-        if (beyond) {  // kept going: lock this step in; the next one starts from here
-            commitPinchStep();
-            pinchBase = cum;
-        }
-    }
-
-    private void pinchEnd() {
-        if (pinchTo == 0) return;
-        final boolean keep = pinchProgress(pinchEff) >= 0.5f;
-        float target = keep ? pinchRatio() : 1f;
-        float clamped = pinchRatio() > 1 ? Math.max(1f, Math.min(pinchRatio(), pinchEff))
-                : Math.min(1f, Math.max(pinchRatio(), pinchEff));
-        pinchAnim = android.animation.ValueAnimator.ofFloat(clamped, target);
-        float dist = Math.abs(pinchProgress(clamped) - (keep ? 1f : 0f));
-        pinchAnim.setDuration((long) (90 + 170 * dist));
-        pinchAnim.setInterpolator(new android.view.animation.DecelerateInterpolator(1.5f));
-        pinchAnim.addUpdateListener(an -> setPinchEff((float) an.getAnimatedValue()));
-        pinchAnim.addListener(new android.animation.AnimatorListenerAdapter() {
-            private boolean done;
-
-            @Override public void onAnimationEnd(android.animation.Animator an) {
-                if (done) return;
-                done = true;
-                if (pinchTo == 0) return;
-                if (keep) commitPinchStep(); else abortPinchStep();
+        GridGeom(int cols) {
+            this.cols = cols;
+            width = list.getWidth();
+            tile = width / cols;
+            buildRows(cols, rows);
+            rowY = new int[rows.size() + 1];
+            itemY = new int[shown.size()];
+            itemCol = new int[shown.size()];
+            int y = 0;
+            for (int r = 0; r < rows.size(); r++) {
+                rowY[r] = y;
+                Object o = rows.get(r);
+                if (o instanceof Header) {
+                    headers.add((Header) o);
+                    headerY.add(y);
+                    y += headerHeight();
+                } else {
+                    TileRow tr = (TileRow) o;
+                    for (int c = 0; c < tr.count; c++) { itemY[tr.start + c] = y; itemCol[tr.start + c] = c; }
+                    y += tile;
+                }
             }
-        });
-        pinchAnim.start();
-    }
-
-    private int firstVisibleItem() {
-        int pos = list.getFirstVisiblePosition();
-        for (int i = Math.max(0, pos); i < rows.size(); i++) {
-            Object r = rows.get(i);
-            if (r instanceof TileRow) return ((TileRow) r).start;
-            if (r instanceof Header) return ((Header) r).start;
+            rowY[rows.size()] = y;
+            total = y + list.getPaddingBottom();
         }
-        return -1;
-    }
 
-    private void scrollToItem(int item) {
-        if (item < 0) return;
-        for (int i = 0; i < rows.size(); i++) {
-            Object r = rows.get(i);
-            if (r instanceof TileRow && ((TileRow) r).start + ((TileRow) r).count > item) { list.setSelection(i); return; }
+        float x(int i) { return itemCol[i] * (width / (float) cols); }
+
+        float maxScroll(int viewH) { return Math.max(0, total - viewH); }
+
+        /** First photo whose tile reaches below y. */
+        int firstBelow(float y) {
+            int lo = 0, hi = itemY.length;
+            while (lo < hi) { int m = (lo + hi) >>> 1; if (itemY[m] + tile <= y) lo = m + 1; else hi = m; }
+            return lo;
+        }
+
+        /** Last photo whose tile starts above y. */
+        int lastAbove(float y) {
+            int lo = -1, hi = itemY.length - 1;
+            while (lo < hi) { int m = (lo + hi + 1) >>> 1; if (itemY[m] < y) lo = m; else hi = m - 1; }
+            return lo;
+        }
+
+        int rowAt(float y) {
+            int lo = 0, hi = rows.size() - 1;
+            while (lo < hi) { int m = (lo + hi + 1) >>> 1; if (rowY[m] <= y) lo = m; else hi = m - 1; }
+            return lo;
         }
     }
 
-    /** Freezes the current grid as a picture on top, then lays out the target column count underneath. */
-    private void startPinchStep(int delta) {
-        int from = cols(), to = Math.max(2, Math.min(7, from + delta));
-        if (to == from || list.getWidth() == 0 || list.getHeight() == 0) { pinchTo = 0; return; }
-        FrameLayout parent = (FrameLayout) list.getParent();
-        removeGridSnapshot();
-        resetListTransform();
-        try {
-            if (snapBitmap == null || snapBitmap.getWidth() != list.getWidth() || snapBitmap.getHeight() != list.getHeight()) {
-                snapBitmap = android.graphics.Bitmap.createBitmap(list.getWidth(), list.getHeight(),
-                        android.graphics.Bitmap.Config.ARGB_8888);
+    /** The overlay that draws the transition between two column counts. */
+    private final class GridMorph extends View {
+        GridGeom from, to;
+        float scrollFrom, scrollTo, p, fx, fy;
+        final android.graphics.Paint bmpPaint = new android.graphics.Paint(android.graphics.Paint.FILTER_BITMAP_FLAG);
+        final android.graphics.Paint fill = new android.graphics.Paint();
+        final android.graphics.Paint text = new android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG);
+        final android.graphics.Rect src = new android.graphics.Rect();
+        final android.graphics.RectF dst = new android.graphics.RectF();
+
+        GridMorph(Context c) {
+            super(c);
+            text.setColor(ui.text);
+            text.setTextSize(15 * getResources().getDisplayMetrics().scaledDensity);
+            text.setFakeBoldText(true);
+        }
+
+        /** Sets the next column count and lines it up so the photo under (fx, fy) stays under the fingers. */
+        boolean target(int cols, float fx, float fy) {
+            if (cols < 2 || cols > 7 || cols == from.cols) return false;
+            this.fx = fx;
+            this.fy = fy;
+            to = new GridGeom(cols);
+            int h = getHeight() > 0 ? getHeight() : list.getHeight();
+            int a = anchor(fx, fy, h);
+            float oy = from.itemY[a] - scrollFrom;                  // anchor's top on screen now
+            float k = to.tile / (float) from.tile;
+            float ny = fy - (fy - oy) * k;                            // where its top should land
+            scrollTo = Math.max(0, Math.min(to.maxScroll(h), to.itemY[a] - ny));
+            return true;
+        }
+
+        private int anchor(float fx, float fy, int h) {
+            float ay = fy + scrollFrom;
+            int first = from.firstBelow(scrollFrom), last = from.lastAbove(scrollFrom + h);
+            int best = Math.max(0, Math.min(first, shown.size() - 1));
+            float bestD = Float.MAX_VALUE;
+            for (int i = Math.max(0, first); i <= last && i < shown.size(); i++) {
+                float cx = from.x(i) + from.tile / 2f, cy = from.itemY[i] + from.tile / 2f;
+                float d = (cx - fx) * (cx - fx) + (cy - ay) * (cy - ay);
+                if (d < bestD) { bestD = d; best = i; }
             }
-            android.graphics.Canvas cv = new android.graphics.Canvas(snapBitmap);
+            return best;
+        }
+
+        /** The old target becomes the starting point (used when the pinch keeps going to the next count). */
+        void advance() {
+            from = to;
+            scrollFrom = scrollTo;
+            to = null;
+            p = 0f;
+        }
+
+        void setProgress(float v) {
+            p = v;
+            invalidate();
+        }
+
+        @Override
+        protected void onDraw(android.graphics.Canvas cv) {
             cv.drawColor(ui.bg);
-            list.draw(cv);
-            gridSnapshot = new ImageView(this);
-            gridSnapshot.setImageBitmap(snapBitmap);
-            gridSnapshot.setBackgroundColor(ui.bg);
-            parent.addView(gridSnapshot, 1, new FrameLayout.LayoutParams(Ui.MATCH, Ui.MATCH));
-        } catch (Throwable t) {
-            pinchTo = 0;
-            return;
+            if (from == null) return;
+            int h = getHeight();
+            float t = to == null ? 0f : p;
+            GridGeom b = to == null ? from : to;
+            float sb = to == null ? scrollFrom : scrollTo;
+            int gap = Math.max(1, ui.px(1));
+
+            // day headers
+            for (int k = 0; k < from.headers.size() && k < b.headers.size(); k++) {
+                float y0 = from.headerY.get(k) - scrollFrom, y1 = b.headerY.get(k) - sb;
+                float y = y0 + (y1 - y0) * t;
+                if (y > h || y + headerHeight() < 0) continue;
+                text.setAlpha(255);
+                cv.drawText(from.headers.get(k).label, ui.px(16), y + headerHeight() * 0.66f, text);
+            }
+
+            // photos: everything visible in either layout
+            int a0 = from.firstBelow(scrollFrom), a1 = from.lastAbove(scrollFrom + h);
+            int b0 = b.firstBelow(sb), b1 = b.lastAbove(sb + h);
+            int lo = Math.min(a0, b0), hi = Math.max(a1, b1);
+            if (hi - lo > 600) { lo = Math.max(lo, Math.min(a0, b0)); hi = lo + 600; }
+            for (int i = Math.max(0, lo); i <= hi && i < shown.size(); i++) {
+                float ox = from.x(i), oy = from.itemY[i] - scrollFrom, os = from.tile;
+                float nx = b.x(i), ny = b.itemY[i] - sb, ns = b.tile;
+                boolean inOld = oy < h && oy + os > 0, inNew = ny < h && ny + ns > 0;
+                float alpha = inOld && inNew ? 1f : inOld ? 1f - t : t;
+                if (alpha <= 0.01f) continue;
+                Item e = shown.get(i);
+                if (Math.abs(nx - ox) > from.width / 2f) {
+                    // wraps to another row: fade out where it was and in where it lands, both zooming with the grid,
+                    // instead of flying across the other photos
+                    float k = ns / os, z1 = 1f + (k - 1f) * t, z2 = 1f / k + (1f - 1f / k) * t;
+                    drawTile(cv, e, fx + (ox - fx) * z1, fy + (oy - fy) * z1, os * z1, alpha * (1f - smooth(0f, 0.6f, t)), gap);
+                    drawTile(cv, e, fx + (nx - fx) * z2, fy + (ny - fy) * z2, ns * z2, alpha * smooth(0.4f, 1f, t), gap);
+                } else {
+                    drawTile(cv, e, ox + (nx - ox) * t, oy + (ny - oy) * t, os + (ns - os) * t, alpha, gap);
+                }
+            }
         }
-        pinchFirstItem = firstVisibleItem();
-        pinchFrom = from;
-        pinchTo = to;
-        gridCols = to;
-        rebuildRows();
-        adapter.notifyDataSetChanged();
-        scrollToItem(pinchFirstItem);
-        setPinchEff(1f);
+
+        private void drawTile(android.graphics.Canvas cv, Item e, float x, float y, float sz, float alpha, int gap) {
+            if (alpha <= 0.01f) return;
+            dst.set(x + gap, y + gap, x + sz - gap, y + sz - gap);
+            android.graphics.Bitmap bm = thumbs.cached(e);
+            if (bm != null) {
+                int bw = bm.getWidth(), bh = bm.getHeight(), side = Math.min(bw, bh);
+                src.set((bw - side) / 2, (bh - side) / 2, (bw + side) / 2, (bh + side) / 2);
+                bmpPaint.setAlpha((int) (255 * alpha));
+                cv.drawBitmap(bm, src, dst, bmpPaint);
+            } else {
+                fill.setColor(ui.surface2);
+                fill.setAlpha((int) (255 * alpha));
+                cv.drawRect(dst, fill);
+            }
+            if (e.selected) {
+                fill.setColor(ui.selected);
+                fill.setAlpha((int) (alphaOf(ui.selected) * alpha));
+                cv.drawRect(dst, fill);
+            }
+        }
     }
 
     private static float smooth(float a, float b, float x) {
@@ -1092,58 +1161,112 @@ public class MainActivity extends Activity {
         return t * t * (3f - 2f * t);
     }
 
-    /** eff = finger distance relative to where this step started (1 = start, ratio = finished). */
-    private void setPinchEff(float eff) {
-        pinchEff = eff;
-        if (pinchTo == 0) return;
-        float ratio = pinchRatio();
-        // follow the fingers, with a little give past either end
-        float lo = Math.min(1f, ratio), hi = Math.max(1f, ratio);
-        float e = eff < lo ? lo - (lo - eff) * 0.25f : eff > hi ? hi + (eff - hi) * 0.25f : eff;
-        float p = pinchProgress(e);
-        if (gridSnapshot != null) {
-            gridSnapshot.setPivotX(pinchFx);
-            gridSnapshot.setPivotY(pinchFy);
-            gridSnapshot.setScaleX(e);
-            gridSnapshot.setScaleY(e);
-            gridSnapshot.setAlpha(1f - smooth(0.3f, 0.7f, p));
+    private static int alphaOf(int c) { return (c >>> 24) & 0xff; }
+
+    private GridMorph morph;
+    private int pinchDir = 0;
+    private float pinchBase = 1f, morphP = 0f;
+    private android.animation.ValueAnimator pinchAnim;
+
+    private void pinchBegin() {
+        if (pinchAnim != null) pinchAnim.end();
+        pinchDir = 0;
+        pinchBase = 1f;
+    }
+
+    /** How far the fingers have gone toward the target column count (0 = start, 1 = there). */
+    private float morphProgress(float eff) {
+        float ratio = morph.from.cols / (float) morph.to.cols;  // > 1 when thumbnails get bigger
+        return ratio > 1 ? (eff - 1f) / (ratio - 1f) : (1f - eff) / (1f - ratio);
+    }
+
+    private void pinchUpdate(float cum, float fx, float fy) {
+        if (morph == null) {
+            float rel = cum / pinchBase;
+            int dir = rel > 1.05f ? -1 : rel < 0.95f ? +1 : 0;  // -1 = fewer columns
+            if (dir == 0 || (pinchDir != 0 && dir != pinchDir)) return;
+            pinchDir = dir;
+            pinchBase = cum;
+            if (!startMorph(dir, fx, fy)) return;
         }
-        list.setPivotX(pinchFx);
-        list.setPivotY(pinchFy);
-        list.setScaleX(e / ratio);
-        list.setScaleY(e / ratio);
-        list.setAlpha(1f);
+        if (morph.to == null) return;
+        float p = morphProgress(cum / pinchBase);
+        if (p > 1.12f) {  // kept going past the target: make it the new start and aim one more step
+            int next = morph.to.cols + pinchDir;
+            if (next >= 2 && next <= 7) {
+                morph.advance();
+                morph.target(next, fx, fy);
+                pinchBase = cum;
+                p = 0f;
+                list.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK);
+            }
+        }
+        // a little give past either end
+        float shown = p < 0 ? p * 0.25f : p > 1 ? 1f + (p - 1f) * 0.25f : p;
+        morphP = Math.max(-0.08f, Math.min(1.08f, shown));
+        morph.setProgress(morphP);
     }
 
-    private void commitPinchStep() {
-        prefs.setColumns(pinchTo);
-        gridCols = -1;
-        pinchTo = 0;
-        removeGridSnapshot();
-        resetListTransform();
-        list.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK);
+    private boolean startMorph(int dir, float fx, float fy) {
+        if (shown.isEmpty() || list.getWidth() == 0 || list.getChildCount() == 0) return false;
+        int cols = cols();
+        if (cols + dir < 2 || cols + dir > 7) return false;
+        GridMorph m = new GridMorph(this);
+        m.from = new GridGeom(cols);
+        int fp = list.getFirstVisiblePosition();
+        m.scrollFrom = (fp < m.from.rowY.length ? m.from.rowY[fp] : 0) - list.getChildAt(0).getTop();
+        if (!m.target(cols + dir, fx, fy)) return false;
+        FrameLayout parent = (FrameLayout) list.getParent();
+        parent.addView(m, 1, new FrameLayout.LayoutParams(Ui.MATCH, Ui.MATCH));
+        morph = m;
+        morphP = 0f;
+        m.setProgress(0f);
+        return true;
     }
 
-    private void abortPinchStep() {
+    private void pinchEnd() {
+        if (morph == null) return;
+        final GridMorph m = morph;
+        final boolean keep = m.to != null && morphP >= 0.5f;
+        float target = keep ? 1f : 0f;
+        pinchAnim = android.animation.ValueAnimator.ofFloat(morphP, target);
+        pinchAnim.setDuration((long) (100 + 180 * Math.abs(target - morphP)));
+        pinchAnim.setInterpolator(new android.view.animation.DecelerateInterpolator(1.5f));
+        pinchAnim.addUpdateListener(an -> { morphP = (float) an.getAnimatedValue(); m.setProgress(morphP); });
+        pinchAnim.addListener(new android.animation.AnimatorListenerAdapter() {
+            private boolean done;
+
+            @Override public void onAnimationEnd(android.animation.Animator an) {
+                if (done) return;
+                done = true;
+                finishMorph(m, keep);
+            }
+        });
+        pinchAnim.start();
+    }
+
+    /** Puts the real grid exactly where the overlay ended, then removes the overlay once the grid has drawn. */
+    private void finishMorph(final GridMorph m, boolean keep) {
+        GridGeom g = keep && m.to != null ? m.to : m.from;
+        float scroll = keep && m.to != null ? m.scrollTo : m.scrollFrom;
+        if (g.cols != prefs.columns()) list.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK);
+        prefs.setColumns(g.cols);
         gridCols = -1;
-        pinchTo = 0;
         rebuildRows();
         adapter.notifyDataSetChanged();
-        scrollToItem(pinchFirstItem);
-        resetListTransform();
-        removeGridSnapshot();
-    }
-
-    private void resetListTransform() {
-        list.setAlpha(1f);
-        list.setScaleX(1f);
-        list.setScaleY(1f);
-    }
-
-    private void removeGridSnapshot() {
-        if (gridSnapshot == null) return;
-        ((FrameLayout) list.getParent()).removeView(gridSnapshot);
-        gridSnapshot = null;
+        if (!rows.isEmpty()) {
+            int r = g.rowAt(scroll);
+            list.setSelectionFromTop(r, (int) (g.rowY[r] - scroll));
+        }
+        if (morph == m) morph = null;
+        list.getViewTreeObserver().addOnPreDrawListener(new android.view.ViewTreeObserver.OnPreDrawListener() {
+            @Override public boolean onPreDraw() {
+                list.getViewTreeObserver().removeOnPreDrawListener(this);
+                list.postOnAnimation(() -> { if (m.getParent() != null) ((ViewGroup) m.getParent()).removeView(m); });
+                return true;
+            }
+        });
+        list.invalidate();
     }
 
     // ================================================================== copy / move
