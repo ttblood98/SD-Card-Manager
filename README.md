@@ -1,20 +1,32 @@
 # SD-Card-Manager
 
-`index.html` is a one-file feasibility test for importing photos from an SD card
-in the browser (File System Access API): SD card access, Nikon NEF/JPEG
-metadata, copy, delete, rename/move, and whether original file dates survive a copy.
+Offload has two versions with the same features:
 
-## Running it
-Open the GitHub Pages URL in **Chrome or Edge** (phone and PC):
-`https://<user>.github.io/SD-Card-Manager/`
+- **Windows (Chrome or Edge):** a progressive web app at the root of this repository (`index.html`, `js/`, `css/`).
+  Hosted with GitHub Pages, it opens at `https://<user>.github.io/SD-Card-Manager/` and can be installed from the
+  browser's address bar (Install app). It is built for mouse and keyboard.
+- **Android:** a native app in `android/` (see below).
 
-1. Pick the card's `DCIM` folder (or a subfolder like `100NIKON`).
-2. Tap "Select newest NEF + JPG".
-3. Pick a safe destination folder.
-4. Run tests A-D in order (read metadata, copy, verify, delete copies), then E, F, G.
-5. Tap "Copy full report" and paste the result back.
+The original browser feasibility test is kept at `test/feasibility.html`.
 
-The test never touches your photos; it only deletes its own copies and one temp file it creates on the card.
+## Windows app (web)
+
+- **Setup:** choose the card's DCIM folder once; add a photo location (for example Pictures) once. Both are remembered.
+- **Gallery:** grouped by day; RAW / JPEG / Other filters (Other is off by default), a date dropdown with a
+  pick-the-first-and-last-day calendar, sort. Hold **Ctrl and use the scroll wheel** (or the - / + buttons) to change
+  the thumbnail size; photos glide to their new places and the one under the mouse stays put.
+- **Selecting:** click opens a photo; **click and drag across photos** selects a range (the grid scrolls at the edges);
+  Shift+click, Ctrl+click, the round check on each photo, Ctrl+A, Esc; each day has a Select button.
+- **Viewer:** the **scroll wheel zooms** around the pointer, drag pans when zoomed; drag left/right, the side arrows or
+  the arrow keys move between photos; double-click zooms; Space selects; Del deletes. Details show resolution,
+  camera, lens and exposure.
+- **Copy / Move:** pick the album in Offload's album browser (cover photos, counts, recent albums, New album, a preview
+  of what is already inside). Every copy is read back and checked (CRC32); Move deletes an original only after its
+  copy verifies. Files already in the album are skipped, never overwritten. "Show in album" opens it afterwards.
+- **Delete:** with a confirmation; deleting one photo offers to delete its matching RAW/JPEG too (ticked by default).
+- Runs offline once loaded (service worker). Browsers cannot set a file's date, so copies get today's file date;
+  the photo's own "date taken" inside the file is unchanged.
+- `test/e2e/` has an end-to-end test that drives the app in headless Chromium against a fake card.
 
 ## Android app: Offload
 
