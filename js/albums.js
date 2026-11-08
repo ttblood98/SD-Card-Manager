@@ -1,7 +1,7 @@
 // Where to put the photos: a second gallery, of albums. Folders show as album tiles with a cover photo and a count.
 // Opening an album shows the albums inside it and the photos already there, plus a big "Copy here" button.
 import { el, icon, iconBtn, pushPage, popPage, backPage, pageBar, promptText, toast, fmtSize, dialog } from './ui.js';
-import { locationList, locationHandle, addLocation, recents, ensurePermission, idbGet, idbPut } from './store.js';
+import { locationList, locationHandle, addLocation, recents, ensurePermission, idbGet, idbPut, diskPath, setDiskPath } from './store.js';
 import { listAlbum, resolvePath, createAlbum, pickFolder, cleanName } from './files.js';
 import { thumbFor, requestThumb } from './media.js';
 
@@ -25,9 +25,14 @@ export function openAlbumPicker(app, items, mode, start) {
   const scroll = el('div', { class: 'scroll' }, body);
   const goBtn = el('button', { class: 'btn primary', text: `${mode === 'move' ? 'Move' : 'Copy'} ${what} here` });
   const footer = el('div', { class: 'footer' }, goBtn);
+  const explorerBtn = el('button', {
+    class: 'btn flat', text: 'Show in File Explorer', style: { display: 'none' },
+    title: "Copies this album's folder path so you can paste it into File Explorer",
+    onclick: () => showInExplorer(app, path[path.length - 1]),
+  });
   const page = {
     el: el('div', null,
-      pageBar(browse ? 'Albums' : mode === 'move' ? 'Move to album' : 'Copy to album', browse ? null : `${what} · ${fmtSize(bytes)}`),
+      pageBar(browse ? 'Albums' : mode === 'move' ? 'Move to album' : 'Copy to album', browse ? null : `${what} · ${fmtSize(bytes)}`, explorerBtn),
       crumbs, scroll, footer),
   };
   // path: [] = start screen; else [{loc, names, dir, label}] from a location down to the open album
@@ -69,6 +74,7 @@ export function openAlbumPicker(app, items, mode, start) {
     const cur = path[path.length - 1];
     footer.style.display = cur && !browse ? '' : 'none';
     crumbs.style.display = cur ? '' : 'none';
+    explorerBtn.style.display = cur ? '' : 'none';
     if (!cur) renderStart(); else renderAlbum(cur);
   }
 
@@ -210,6 +216,40 @@ export function openAlbumPicker(app, items, mode, start) {
     if (loc) { openLoc(loc, start.path || []); return; }
   }
   render();
+}
+
+/**
+ * Browsers can't open File Explorer, and never reveal where a folder is on disk. So: the first time, ask where this photo
+ * location lives (remembered), then copy the album's full path to the clipboard to paste into Explorer's address bar.
+ */
+export async function showInExplorer(app, cur) {
+  if (!cur) return;
+  const loc = locationList().find(l => l.id === cur.loc);
+  let base = diskPath(cur.loc);
+  if (!base) {
+    const input = el('input', { type: 'text', class: 'text-input', placeholder: 'C:\\Users\\you\\Pictures' });
+    let okBtn;
+    input.addEventListener('keydown', e => { if (e.key === 'Enter') okBtn.click(); });
+    const body = el('div', null,
+      el('p', { class: 'dim', text: `Your browser doesn't tell Offload where "${loc ? loc.name : 'this folder'}" is on the computer, so type it once. Tip: in File Explorer, hold Shift, right-click that folder and choose "Copy as path", then paste it here.` }),
+      input);
+    const v = await dialog({
+      title: 'Where is this folder on your computer?', body,
+      buttons: [{ text: 'Cancel', value: null }, { text: 'Save', kind: 'primary', value: 'ok', ref: b => { okBtn = b; } }],
+    });
+    if (v !== 'ok') return;
+    setDiskPath(cur.loc, input.value.trim().replace(/^"|"$/g, ''));
+    base = diskPath(cur.loc);
+    if (!base) return;
+  }
+  const full = [base, ...cur.names].join('\\');
+  try {
+    await navigator.clipboard.writeText(full);
+    toast('Path copied. In File Explorer, click the address bar and paste (Ctrl+V).');
+  } catch (e) {
+    await dialog({ title: 'Folder path', body: full });
+  }
+  app.log('Folder path for File Explorer: ' + full);
 }
 
 function describe(res) {

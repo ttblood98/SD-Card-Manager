@@ -109,6 +109,16 @@ export async function removeLocation(id) {
 
 export function locationHandle(id) { return idbGet('handles', 'loc:' + id); }
 
+// Where a photo location lives on disk (browsers never reveal this, so the user tells us once): {locId: 'C:\\Users\\me\\Pictures'}
+export function diskPath(id) { return (getPref('diskpaths', {})[id]) || ''; }
+
+export function setDiskPath(id, p) {
+  const all = getPref('diskpaths', {});
+  const v = (p || '').trim().replace(/[\\/]+$/, '');
+  if (v) all[id] = v; else delete all[id];
+  setPref('diskpaths', all);
+}
+
 // Recent destinations: [{loc, path: [names], label}]
 export function recents() { return getPref('recents', []); }
 

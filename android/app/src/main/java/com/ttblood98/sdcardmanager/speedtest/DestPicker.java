@@ -41,6 +41,7 @@ final class DestPicker implements MainActivity.Page {
     private final HorizontalScrollView crumbScroll;
     private final ScrollView scroll;
     private final TextView goBtn;
+    private TextView openBtn;
     private int token = 0;
 
     DestPicker(MainActivity a, List<Item> todo, boolean move) {
@@ -71,7 +72,12 @@ final class DestPicker implements MainActivity.Page {
         root = ui.vbox();
         root.setBackgroundColor(ui.bg);
         TextView sub = browse ? null : ui.text(what + " · " + Ui.fmtSize(bytes), 13, ui.textDim, false);
-        root.addView(a.pageBar(browse ? "Albums" : move ? "Move to album" : "Copy to album", sub), Ui.lp(Ui.MATCH, Ui.WRAP));
+        openBtn = ui.flatButton("Open in Files", v -> {
+            Prefs.Dest cur = current();
+            if (cur != null) a.openInFiles(cur.tree, cur.docId);
+        });
+        openBtn.setVisibility(View.GONE);
+        root.addView(a.pageBar(browse ? "Albums" : move ? "Move to album" : "Copy to album", sub, openBtn), Ui.lp(Ui.MATCH, Ui.WRAP));
 
         crumbScroll = new HorizontalScrollView(a);
         crumbScroll.setHorizontalScrollBarEnabled(false);
@@ -117,6 +123,7 @@ final class DestPicker implements MainActivity.Page {
         Prefs.Dest cur = current();
         crumbScroll.setVisibility(cur == null ? View.GONE : View.VISIBLE);
         bottom.setVisibility(cur == null || browse ? View.GONE : View.VISIBLE);
+        if (openBtn != null) openBtn.setVisibility(cur == null ? View.GONE : View.VISIBLE);
         if (cur == null) showStart(); else showAlbum(cur);
     }
 

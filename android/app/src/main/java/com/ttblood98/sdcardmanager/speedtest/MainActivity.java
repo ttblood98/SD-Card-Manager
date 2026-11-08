@@ -14,6 +14,7 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
+import android.provider.DocumentsContract;
 import android.view.Gravity;
 import android.view.HapticFeedbackConstants;
 import android.view.MotionEvent;
@@ -194,6 +195,19 @@ public class MainActivity extends Activity {
 
     private void refreshPages() {
         for (Page p : pages) p.refresh();
+    }
+
+    /** Opens a folder in the phone's own file manager. Falls back to a message if no app can show it. */
+    void openInFiles(Uri tree, String docId) {
+        Uri doc = DocumentsContract.buildDocumentUri(tree.getAuthority(), docId);
+        Intent view = new Intent(Intent.ACTION_VIEW).setDataAndType(doc, DocumentsContract.Document.MIME_TYPE_DIR)
+                .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_ACTIVITY_NEW_TASK);
+        try { startActivity(view); return; } catch (Exception ignored) { }
+        Intent browse = new Intent("android.provider.action.BROWSE").setData(doc)
+                .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_ACTIVITY_NEW_TASK);
+        try { startActivity(browse); return; } catch (Exception ignored) { }
+        Toast.makeText(this, "No file manager on this phone can open that folder", Toast.LENGTH_LONG).show();
+        log("Open in Files failed for " + doc);
     }
 
     /** A top bar with a Back arrow, used by every page. */

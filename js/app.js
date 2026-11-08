@@ -8,7 +8,7 @@ import { openViewer, viewerOpen, closeViewer, refreshViewer } from './viewer.js'
 import { openAlbumPicker, invalidateCovers } from './albums.js';
 import { openSettings, openLog } from './settings.js';
 
-export const VERSION = '1.0.0';
+export const VERSION = '1.0.1';
 const SORTS = { new: 'Newest first', old: 'Oldest first', name: 'Name A–Z', size: 'Largest first' };
 const TYPES = ['raw', 'jpg', 'other'];
 

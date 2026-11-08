@@ -2,7 +2,7 @@
 import { el, icon, pushPage, pageBar, dialog, toast, menu } from './ui.js';
 import { setPref, locationList, removeLocation, recents, setPref as save, idbClear } from './store.js';
 import { pickFolder } from './files.js';
-import { addLocation } from './store.js';
+import { addLocation, diskPath, setDiskPath } from './store.js';
 import { thumbStats } from './media.js';
 
 function row(ico, title, sub, trailing, onclick) {
@@ -36,6 +36,13 @@ export function openSettings(app) {
           if (ok) { await removeLocation(l.id); render(); }
         },
       }), null));
+    }
+    for (const l of locationList()) {
+      locCard.append(row(null, `Where is ${l.name} on disk?`, diskPath(l.id) || 'For "Show in File Explorer" \u2013 browsers can\'t tell us. Optional.', null, async () => {
+        const input = el('input', { type: 'text', class: 'text-input', value: diskPath(l.id), placeholder: 'C:\\Users\\you\\Pictures' });
+        const v = await dialog({ title: `Folder path of ${l.name}`, body: input, buttons: [{ text: 'Cancel', value: null }, { text: 'Save', kind: 'primary', value: 'ok' }] });
+        if (v === 'ok') { setDiskPath(l.id, input.value.trim().replace(/^"|"$/g, '')); render(); }
+      }));
     }
     locCard.append(row(icon.plus, 'Add photo location', 'The browser asks once; it is remembered', null, async () => {
       try { const h = await pickFolder('dest'); await addLocation(h); app.log('Photo location added: ' + h.name); render(); }

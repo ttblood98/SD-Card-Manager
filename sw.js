@@ -1,5 +1,5 @@
 // Offline support: the app shell is cached; each release bumps VERSION so the new files are picked up.
-const VERSION = 'offload-1.0.0';
+const VERSION = 'offload-1.0.1';
 const SHELL = [
   './', 'index.html', 'manifest.webmanifest', 'css/app.css',
   'js/app.js', 'js/ui.js', 'js/store.js', 'js/files.js', 'js/media.js', 'js/viewer.js', 'js/albums.js', 'js/settings.js',
