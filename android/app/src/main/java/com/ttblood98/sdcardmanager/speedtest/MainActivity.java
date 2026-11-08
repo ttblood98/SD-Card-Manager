@@ -12,6 +12,11 @@ import android.content.SharedPreferences;
 import android.content.UriPermission;
 import android.database.Cursor;
 import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
+import android.graphics.Matrix;
+import android.graphics.drawable.ColorDrawable;
+import android.os.ParcelFileDescriptor;
+import android.widget.ImageView;
 import android.graphics.Point;
 import android.graphics.Typeface;
 import android.net.Uri;
@@ -34,7 +39,11 @@ import android.widget.ListView;
 import android.widget.ScrollView;
 import android.widget.TextView;
 
+import java.io.FileInputStream;
 import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.nio.channels.FileChannel;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.text.SimpleDateFormat;
@@ -197,9 +206,14 @@ public class MainActivity extends Activity {
                     meta.setTextSize(12);
                     col.addView(name);
                     col.addView(meta);
+                    ImageView iv = new ImageView(MainActivity.this);
+                    iv.setScaleType(ImageView.ScaleType.CENTER_CROP);
+                    LinearLayout.LayoutParams ivp = new LinearLayout.LayoutParams((int) (64 * dp), (int) (64 * dp));
+                    ivp.setMargins(0, 0, (int) (8 * dp), 0);
                     rowV.addView(cb);
+                    rowV.addView(iv, ivp);
                     rowV.addView(col);
-                    rowV.setTag(new View[]{cb, name, meta});
+                    rowV.setTag(new View[]{cb, name, meta, iv});
                 } else {
                     rowV = (LinearLayout) convert;
                 }
@@ -208,6 +222,7 @@ public class MainActivity extends Activity {
                 ((CheckBox) v[0]).setChecked(e.selected);
                 ((TextView) v[1]).setText(e.name);
                 ((TextView) v[2]).setText(T_NAMES[e.type] + " · " + fmtSize(e.size) + " · " + fmtDateTime.format(new Date(e.mtime)));
+                bindThumb((ImageView) v[3], e);
                 return rowV;
             }
         };
@@ -230,7 +245,7 @@ public class MainActivity extends Activity {
         root.addView(r4);
 
         LinearLayout r5 = row();
-        thumbBtn = button("Thumbnail test", v -> startWork(this::thumbTest));
+        thumbBtn = button("Thumbnail stats", v -> thumbStats());
         reportBtn = button("Copy report", v -> copyReport());
         r5.addView(thumbBtn, weight());
         r5.addView(reportBtn, weight());
@@ -270,7 +285,7 @@ public class MainActivity extends Activity {
         dstBtn.setEnabled(idle);
         copyBtn.setEnabled(idle);
         moveBtn.setEnabled(idle);
-        thumbBtn.setEnabled(idle && !files.isEmpty());
+        thumbBtn.setEnabled(!files.isEmpty());
         cancelBtn.setVisibility(idle ? View.GONE : View.VISIBLE);
         cancelBtn.setEnabled(!idle);
     }
@@ -398,6 +413,7 @@ public class MainActivity extends Activity {
         log("Scanned " + found.size() + " files (" + fmtSize(bytes) + ") in " + dirs + " folders in " + ms + " ms");
         final int n = found.size();
         ui.post(() -> {
+            thumbMissing.clear();
             files.clear();
             files.addAll(found);
             applyFilter();
@@ -815,29 +831,224 @@ public class MainActivity extends Activity {
         if (!moved.isEmpty()) ui.post(() -> { files.removeAll(moved); applyFilter(); });
     }
 
-    // ---------------------------------------------------------------- thumbnail test
+    // ---------------------------------------------------------------- thumbnails
 
-    private void thumbTest() {
-        ContentResolver cr = getContentResolver();
-        List<Entry> pick = new ArrayList<>();
-        int raw = 0, jpg = 0;
-        List<Entry> sorted = new ArrayList<>(files);
-        Collections.sort(sorted, (a, b) -> Long.compare(b.mtime, a.mtime));
-        for (Entry e : sorted) {
-            if (e.type == T_RAW && raw < 5) { pick.add(e); raw++; }
-            else if (e.type == T_JPG && jpg < 5) { pick.add(e); jpg++; }
+    private final android.util.LruCache<String, Bitmap> thumbCache = new android.util.LruCache<String, Bitmap>(24 * 1024) {
+        @Override protected int sizeOf(String k, Bitmap b) { return b.getByteCount() / 1024; }
+    };
+    private final java.util.concurrent.ExecutorService thumbPool = java.util.concurrent.Executors.newFixedThreadPool(3);
+    private final Set<String> thumbPending = new HashSet<>();  // UI thread only
+    private final Set<String> thumbMissing = java.util.concurrent.ConcurrentHashMap.newKeySet();
+    private final java.util.concurrent.ConcurrentHashMap<String, Long> thumbSeen = new java.util.concurrent.ConcurrentHashMap<>();
+    private boolean thumbRefreshScheduled = false;
+    private final java.util.concurrent.atomic.AtomicInteger rawOk = new java.util.concurrent.atomic.AtomicInteger(),
+            rawFail = new java.util.concurrent.atomic.AtomicInteger(), picOk = new java.util.concurrent.atomic.AtomicInteger(),
+            picFail = new java.util.concurrent.atomic.AtomicInteger();
+    private final java.util.concurrent.atomic.AtomicLong rawMs = new java.util.concurrent.atomic.AtomicLong(),
+            picMs = new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicBoolean rawOkLogged = new java.util.concurrent.atomic.AtomicBoolean(),
+            rawFailLogged = new java.util.concurrent.atomic.AtomicBoolean(), picFailLogged = new java.util.concurrent.atomic.AtomicBoolean();
+
+    @Override
+    protected void onDestroy() {
+        super.onDestroy();
+        thumbPool.shutdownNow();
+    }
+
+    private void bindThumb(ImageView iv, Entry e) {
+        final String key = e.uri.toString();
+        iv.setTag(key);
+        Bitmap b = thumbCache.get(key);
+        if (b != null) { iv.setImageBitmap(b); return; }
+        iv.setImageDrawable(new ColorDrawable(0xFFDDDDDD));
+        if (e.type == T_OTHER || thumbMissing.contains(key)) return;
+        thumbSeen.put(key, SystemClock.elapsedRealtime());
+        if (!thumbPending.add(key)) return;
+        final Entry fe = e;
+        try {
+            thumbPool.execute(() -> {
+                Long seen = thumbSeen.get(key);
+                boolean wanted = seen != null && SystemClock.elapsedRealtime() - seen < 2500;
+                if (!wanted || busy) { ui.post(() -> thumbPending.remove(key)); return; }
+                final Bitmap bm = loadThumb(fe);
+                ui.post(() -> {
+                    thumbPending.remove(key);
+                    if (bm != null) thumbCache.put(key, bm); else thumbMissing.add(key);
+                    if (!thumbRefreshScheduled) {
+                        thumbRefreshScheduled = true;
+                        ui.postDelayed(() -> { thumbRefreshScheduled = false; adapter.notifyDataSetChanged(); }, 80);
+                    }
+                });
+            });
+        } catch (Exception ex) {
+            thumbPending.remove(key);
         }
-        log("Thumbnail test: asking the system for thumbnails of " + raw + " RAW and " + jpg + " JPEG files...");
-        for (Entry e : pick) {
-            long t0 = SystemClock.elapsedRealtime();
-            try {
-                Bitmap bm = DocumentsContract.getDocumentThumbnail(cr, e.uri, new Point(256, 256), null);
-                long ms = SystemClock.elapsedRealtime() - t0;
-                log("  " + e.name + ": " + (bm == null ? "no thumbnail" : bm.getWidth() + "x" + bm.getHeight()) + " in " + ms + " ms");
-            } catch (Exception ex) {
-                log("  " + e.name + ": failed " + ex);
+    }
+
+    private Bitmap loadThumb(Entry e) {
+        ContentResolver cr = getContentResolver();
+        long t0 = SystemClock.elapsedRealtime();
+        Bitmap bm = null;
+        String err = null;
+        try {
+            if (e.type == T_RAW) {
+                bm = rawPreview(cr, e.uri);
+            } else {
+                try { bm = DocumentsContract.getDocumentThumbnail(cr, e.uri, new Point(200, 200), null); } catch (Exception ex) { err = ex.toString(); }
+                if (bm == null) bm = decodeSampled(cr, e.uri, 200);
+            }
+        } catch (Throwable t) {
+            err = t.getMessage() != null ? t.getMessage() : t.toString();
+        }
+        long ms = SystemClock.elapsedRealtime() - t0;
+        if (e.type == T_RAW) {
+            if (bm != null) {
+                rawOk.incrementAndGet(); rawMs.addAndGet(ms);
+                if (rawOkLogged.compareAndSet(false, true)) log("First RAW preview: " + e.name + " " + bm.getWidth() + "x" + bm.getHeight() + " in " + ms + " ms");
+            } else {
+                rawFail.incrementAndGet();
+                if (rawFailLogged.compareAndSet(false, true)) log("RAW preview failed for " + e.name + ": " + err);
+            }
+        } else {
+            if (bm != null) { picOk.incrementAndGet(); picMs.addAndGet(ms); }
+            else {
+                picFail.incrementAndGet();
+                if (picFailLogged.compareAndSet(false, true)) log("Thumbnail failed for " + e.name + ": " + err);
             }
         }
+        return bm;
+    }
+
+    private void thumbStats() {
+        int ro = rawOk.get(), rf = rawFail.get(), po = picOk.get(), pf = picFail.get();
+        log("Thumbnails so far: RAW " + ro + " ok / " + rf + " failed" + (ro > 0 ? ", avg " + (rawMs.get() / ro) + " ms" : "")
+                + "; JPEG/PNG " + po + " ok / " + pf + " failed" + (po > 0 ? ", avg " + (picMs.get() / po) + " ms" : "")
+                + "; cached " + thumbCache.size() / 1024 + " MB");
+    }
+
+    private static Bitmap decodeSampled(ContentResolver cr, Uri uri, int target) throws IOException {
+        BitmapFactory.Options o = new BitmapFactory.Options();
+        o.inJustDecodeBounds = true;
+        try (InputStream in = cr.openInputStream(uri)) { BitmapFactory.decodeStream(in, null, o); }
+        int mx = Math.max(o.outWidth, o.outHeight);
+        if (mx <= 0) return null;
+        int sample = 1;
+        while (mx / (sample * 2) >= target) sample *= 2;
+        BitmapFactory.Options o2 = new BitmapFactory.Options();
+        o2.inSampleSize = sample;
+        try (InputStream in = cr.openInputStream(uri)) { return BitmapFactory.decodeStream(in, null, o2); }
+    }
+
+    // ---- RAW (TIFF-based, e.g. NEF): find the JPEG preview stored inside the file and decode a small version of it
+
+    private static byte[] readAt(FileChannel ch, long pos, int len) throws IOException {
+        if (len < 0 || len > 64 * 1024 * 1024) throw new IOException("bad read length " + len);
+        ByteBuffer bb = ByteBuffer.allocate(len);
+        while (bb.hasRemaining()) {
+            int r = ch.read(bb, pos + bb.position());
+            if (r <= 0) break;
+        }
+        return bb.position() == len ? bb.array() : java.util.Arrays.copyOf(bb.array(), bb.position());
+    }
+
+    private static int u16(byte[] b, int o, ByteOrder bo) { return ByteBuffer.wrap(b).order(bo).getShort(o) & 0xffff; }
+
+    private static long u32(byte[] b, int o, ByteOrder bo) { return ByteBuffer.wrap(b).order(bo).getInt(o) & 0xffffffffL; }
+
+    private static void walkIfd(FileChannel ch, long size, ByteOrder bo, long off, int depth, boolean ifd0,
+                                List<long[]> cands, int[] orient, Set<Long> seen) throws IOException {
+        if (off <= 0 || off + 2 > size || depth > 3 || !seen.add(off)) return;
+        byte[] cb = readAt(ch, off, 2);
+        if (cb.length < 2) return;
+        int count = u16(cb, 0, bo);
+        if (count == 0 || count > 600) return;
+        byte[] buf = readAt(ch, off + 2, count * 12 + 4);
+        if (buf.length < count * 12 + 4) return;
+        long jpgOff = -1, jpgLen = -1, stripOff = -1, stripLen = -1, subVal = 0, subCnt = 0, stripOffCnt = 0, stripLenCnt = 0;
+        int comp = -1;
+        for (int i = 0; i < count; i++) {
+            int o = i * 12;
+            int tag = u16(buf, o, bo), type = u16(buf, o + 2, bo);
+            long cnt = u32(buf, o + 4, bo);
+            long val = (type == 3 && cnt == 1) ? u16(buf, o + 8, bo) : u32(buf, o + 8, bo);
+            switch (tag) {
+                case 0x0201: jpgOff = val; break;
+                case 0x0202: jpgLen = val; break;
+                case 0x0103: comp = (int) val; break;
+                case 0x0111: stripOff = val; stripOffCnt = cnt; break;
+                case 0x0117: stripLen = val; stripLenCnt = cnt; break;
+                case 0x014a: subVal = val; subCnt = cnt; break;
+                case 0x0112: if (ifd0 && depth == 0) orient[0] = (int) val; break;
+                default: break;
+            }
+        }
+        if (jpgOff > 0 && jpgLen > 0) cands.add(new long[]{jpgOff, jpgLen});
+        if ((comp == 6 || comp == 7) && stripOff > 0 && stripLen > 0 && stripOffCnt == 1 && stripLenCnt == 1) {
+            cands.add(new long[]{stripOff, stripLen});
+        }
+        if (subCnt == 1) {
+            walkIfd(ch, size, bo, subVal, depth + 1, false, cands, orient, seen);
+        } else if (subCnt > 1 && subCnt <= 8 && subVal + subCnt * 4 <= size) {
+            byte[] sb = readAt(ch, subVal, (int) subCnt * 4);
+            for (int i = 0; i + 4 <= sb.length; i += 4) {
+                walkIfd(ch, size, bo, u32(sb, i, bo), depth + 1, false, cands, orient, seen);
+            }
+        }
+        long next = u32(buf, count * 12, bo);
+        if (depth == 0 && ifd0 && next > 0) walkIfd(ch, size, bo, next, 0, false, cands, orient, seen);
+    }
+
+    private static Bitmap rawPreview(ContentResolver cr, Uri uri) throws IOException {
+        try (ParcelFileDescriptor pfd = cr.openFileDescriptor(uri, "r")) {
+            if (pfd == null) throw new IOException("could not open the file");
+            FileChannel ch = new FileInputStream(pfd.getFileDescriptor()).getChannel();
+            long size = ch.size();
+            byte[] head = readAt(ch, 0, 8);
+            if (head.length < 8) throw new IOException("file too short");
+            ByteOrder bo;
+            if (head[0] == 0x49 && head[1] == 0x49) bo = ByteOrder.LITTLE_ENDIAN;
+            else if (head[0] == 0x4d && head[1] == 0x4d) bo = ByteOrder.BIG_ENDIAN;
+            else throw new IOException("not a TIFF-based RAW file");
+            if (u16(head, 2, bo) != 42) throw new IOException("not a TIFF-based RAW file");
+            List<long[]> cands = new ArrayList<>();
+            int[] orient = {1};
+            walkIfd(ch, size, bo, u32(head, 4, bo), 0, true, cands, orient, new HashSet<Long>());
+            java.util.Collections.sort(cands, (a, b) -> Long.compare(a[1], b[1]));  // smallest first
+            byte[] fallback = null;
+            int fallbackMax = 0;
+            Bitmap best = null;
+            for (long[] c : cands) {
+                if (c[1] < 500 || c[0] + c[1] > size) continue;
+                byte[] jpg = readAt(ch, c[0], (int) c[1]);
+                if (jpg.length < 2 || (jpg[0] & 0xff) != 0xff || (jpg[1] & 0xff) != 0xd8) continue;
+                BitmapFactory.Options o = new BitmapFactory.Options();
+                o.inJustDecodeBounds = true;
+                BitmapFactory.decodeByteArray(jpg, 0, jpg.length, o);
+                int mx = Math.max(o.outWidth, o.outHeight);
+                if (mx <= 0) continue;
+                if (mx >= 400) { best = decodeJpegSampled(jpg, mx); if (best != null) break; }
+                else if (mx > fallbackMax) { fallback = jpg; fallbackMax = mx; }
+            }
+            if (best == null && fallback != null) best = decodeJpegSampled(fallback, fallbackMax);
+            if (best == null) throw new IOException("no JPEG preview found inside the RAW file (" + cands.size() + " candidates)");
+            return rotateForOrientation(best, orient[0]);
+        }
+    }
+
+    private static Bitmap decodeJpegSampled(byte[] jpg, int mx) {
+        int sample = 1;
+        while (mx / (sample * 2) >= 240) sample *= 2;
+        BitmapFactory.Options o = new BitmapFactory.Options();
+        o.inSampleSize = sample;
+        return BitmapFactory.decodeByteArray(jpg, 0, jpg.length, o);
+    }
+
+    private static Bitmap rotateForOrientation(Bitmap b, int orientation) {
+        int deg = orientation == 3 ? 180 : orientation == 6 ? 90 : orientation == 8 ? 270 : 0;
+        if (deg == 0) return b;
+        Matrix m = new Matrix();
+        m.postRotate(deg);
+        return Bitmap.createBitmap(b, 0, 0, b.getWidth(), b.getHeight(), m, true);
     }
 
     // ---------------------------------------------------------------- misc

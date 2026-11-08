@@ -25,7 +25,7 @@ android {
         minSdk 24
         targetSdk 34
         versionCode (System.getenv('GITHUB_RUN_NUMBER') ? System.getenv('GITHUB_RUN_NUMBER').toInteger() + 100 : 1)
-        versionName '0.3.1'
+        versionName '0.4.0'
     }
 
     compileOptions {
