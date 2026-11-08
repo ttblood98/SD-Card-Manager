@@ -37,12 +37,11 @@ import java.util.concurrent.atomic.AtomicLong;
  * JPEG/PNG use the system thumbnail; RAW (TIFF-based, e.g. NEF) uses the JPEG preview stored inside the file.
  */
 final class Thumbs {
-    interface Listener { void onThumbsChanged(); }
-
     private final ContentResolver cr;
     private final Handler ui;
     private final FileOps.Log log;
-    private final Listener listener;
+    private final java.util.Map<String, List<java.lang.ref.WeakReference<ImageView>>> waiting = new java.util.HashMap<>();
+    private final LruCache<String, String> details = new LruCache<>(400);
     private final LruCache<String, Bitmap> cache = new LruCache<String, Bitmap>(32 * 1024) {
         @Override protected int sizeOf(String k, Bitmap b) { return b.getByteCount() / 1024; }
     };
@@ -51,7 +50,6 @@ final class Thumbs {
     private final Set<String> pending = new HashSet<>();  // UI thread only
     private final Set<String> missing = ConcurrentHashMap.newKeySet();
     private final ConcurrentHashMap<String, Long> seen = new ConcurrentHashMap<>();
-    private boolean refreshScheduled = false;
     volatile boolean paused = false;
 
     private final AtomicInteger rawOk = new AtomicInteger(), rawFail = new AtomicInteger(), picOk = new AtomicInteger(),
@@ -60,12 +58,15 @@ final class Thumbs {
     private final AtomicBoolean rawOkLogged = new AtomicBoolean(), rawFailLogged = new AtomicBoolean(),
             picFailLogged = new AtomicBoolean();
 
-    Thumbs(ContentResolver cr, Handler ui, FileOps.Log log, Listener listener) {
+    Thumbs(ContentResolver cr, Handler ui, FileOps.Log log) {
         this.cr = cr;
         this.ui = ui;
         this.log = log;
-        this.listener = listener;
     }
+
+    String cachedDetails(Item e) { return details.get(e.key()); }
+
+    void putDetails(Item e, String s) { if (s != null) details.put(e.key(), s); }
 
     void shutdown() {
         pool.shutdownNow();
@@ -79,25 +80,31 @@ final class Thumbs {
     /** Shows the cached thumbnail, or a blank and queues a background load. UI thread only. */
     void bind(ImageView iv, Item e) {
         final String key = e.key();
+        iv.setTag(key);
         Bitmap b = cache.get(key);
         if (b != null) { iv.setImageBitmap(b); return; }
         iv.setImageDrawable(null);
         if (e.type == Item.T_OTHER || missing.contains(key)) return;
         seen.put(key, SystemClock.elapsedRealtime());
+        List<java.lang.ref.WeakReference<ImageView>> w = waiting.get(key);
+        if (w == null) { w = new ArrayList<>(); waiting.put(key, w); }
+        w.add(new java.lang.ref.WeakReference<>(iv));
         if (!pending.add(key)) return;
         final Item fe = e;
         try {
             pool.execute(() -> {
                 Long s = seen.get(key);
                 boolean wanted = s != null && SystemClock.elapsedRealtime() - s < 2500;
-                if (!wanted || paused) { ui.post(() -> pending.remove(key)); return; }
+                if (!wanted || paused) { ui.post(() -> { pending.remove(key); waiting.remove(key); }); return; }
                 final Bitmap bm = loadThumb(fe);
                 ui.post(() -> {
                     pending.remove(key);
+                    List<java.lang.ref.WeakReference<ImageView>> ws = waiting.remove(key);
                     if (bm != null) cache.put(key, bm); else missing.add(key);
-                    if (!refreshScheduled) {
-                        refreshScheduled = true;
-                        ui.postDelayed(() -> { refreshScheduled = false; listener.onThumbsChanged(); }, 80);
+                    if (bm == null || ws == null) return;
+                    for (java.lang.ref.WeakReference<ImageView> r : ws) {
+                        ImageView v = r.get();
+                        if (v != null && key.equals(v.getTag())) v.setImageBitmap(bm);
                     }
                 });
             });
@@ -112,8 +119,8 @@ final class Thumbs {
             viewerPool.execute(() -> {
                 Bitmap b = null;
                 try {
-                    if (e.type == Item.T_RAW) b = rawPreview(cr, e.uri, maxDim, true);
-                    else if (e.type != Item.T_OTHER) b = decodeSampled(cr, e.uri, maxDim);
+                    if (e.type == Item.T_RAW) b = rawPreview(cr, e.uri, maxDim, true, true);
+                    else if (e.type != Item.T_OTHER) b = decodeSampled(cr, e.uri, maxDim, true);
                 } catch (Throwable t) {
                     log.log("Preview failed for " + e.name + ": " + t.getMessage());
                 }
@@ -130,16 +137,25 @@ final class Thumbs {
                 + "; cached " + cache.size() / 1024 + " MB";
     }
 
+    /** Loads (and caches) a grid thumbnail synchronously. Call from a background thread. */
+    Bitmap loadThumbSync(Item e) {
+        Bitmap b = cache.get(e.key());
+        if (b != null) return b;
+        b = loadThumb(e);
+        if (b != null) cache.put(e.key(), b);
+        return b;
+    }
+
     private Bitmap loadThumb(Item e) {
         long t0 = SystemClock.elapsedRealtime();
         Bitmap bm = null;
         String err = null;
         try {
             if (e.type == Item.T_RAW) {
-                bm = rawPreview(cr, e.uri, 240, false);
+                bm = rawPreview(cr, e.uri, 240, false, false);
             } else {
                 try { bm = DocumentsContract.getDocumentThumbnail(cr, e.uri, new Point(256, 256), null); } catch (Exception ex) { err = ex.toString(); }
-                if (bm == null) bm = decodeSampled(cr, e.uri, 256);
+                if (bm == null) bm = decodeSampled(cr, e.uri, 256, false);
             }
         } catch (Throwable t) {
             err = t.getMessage() != null ? t.getMessage() : t.toString();
@@ -163,7 +179,7 @@ final class Thumbs {
         return bm;
     }
 
-    static Bitmap decodeSampled(ContentResolver cr, Uri uri, int target) throws IOException {
+    static Bitmap decodeSampled(ContentResolver cr, Uri uri, int target, boolean lowMem) throws IOException {
         BitmapFactory.Options o = new BitmapFactory.Options();
         o.inJustDecodeBounds = true;
         try (InputStream in = cr.openInputStream(uri)) { BitmapFactory.decodeStream(in, null, o); }
@@ -173,6 +189,7 @@ final class Thumbs {
         while (mx / (sample * 2) >= target) sample *= 2;
         BitmapFactory.Options o2 = new BitmapFactory.Options();
         o2.inSampleSize = sample;
+        if (lowMem) o2.inPreferredConfig = Bitmap.Config.RGB_565;
         Bitmap b;
         try (InputStream in = cr.openInputStream(uri)) { b = BitmapFactory.decodeStream(in, null, o2); }
         if (b == null) return null;
@@ -247,7 +264,7 @@ final class Thumbs {
      * Decodes the JPEG preview inside a RAW file. For thumbnails (largest=false) it uses the smallest preview that is
      * at least 400px; for the viewer (largest=true) it uses the biggest one. Output longest side is about target px.
      */
-    static Bitmap rawPreview(ContentResolver cr, Uri uri, int target, boolean largest) throws IOException {
+    static Bitmap rawPreview(ContentResolver cr, Uri uri, int target, boolean largest, boolean lowMem) throws IOException {
         try (ParcelFileDescriptor pfd = cr.openFileDescriptor(uri, "r")) {
             if (pfd == null) throw new IOException("could not open the file");
             FileChannel ch = new FileInputStream(pfd.getFileDescriptor()).getChannel();
@@ -276,20 +293,47 @@ final class Thumbs {
                 BitmapFactory.decodeByteArray(jpg, 0, jpg.length, o);
                 int mx = Math.max(o.outWidth, o.outHeight);
                 if (mx <= 0) continue;
-                if (largest || mx >= 400) { best = decodeJpegSampled(jpg, mx, target); if (best != null) break; }
+                if (largest || mx >= 400) { best = decodeJpegSampled(jpg, mx, target, lowMem); if (best != null) break; }
                 else if (mx > fallbackMax) { fallback = jpg; fallbackMax = mx; }
             }
-            if (best == null && fallback != null) best = decodeJpegSampled(fallback, fallbackMax, target);
+            if (best == null && fallback != null) best = decodeJpegSampled(fallback, fallbackMax, target, lowMem);
             if (best == null) throw new IOException("no JPEG preview found inside the RAW file (" + cands.size() + " candidates)");
             return rotate(best, orient[0]);
         }
     }
 
-    private static Bitmap decodeJpegSampled(byte[] jpg, int mx, int target) {
+    /** Width/height of the largest JPEG preview inside a RAW file (Nikon stores a full-size one), or null. */
+    static int[] rawPreviewSize(ContentResolver cr, Uri uri) {
+        try (ParcelFileDescriptor pfd = cr.openFileDescriptor(uri, "r")) {
+            if (pfd == null) return null;
+            FileChannel ch = new FileInputStream(pfd.getFileDescriptor()).getChannel();
+            long size = ch.size();
+            byte[] head = readAt(ch, 0, 8);
+            if (head.length < 8) return null;
+            ByteOrder bo = head[0] == 0x49 ? ByteOrder.LITTLE_ENDIAN : ByteOrder.BIG_ENDIAN;
+            List<long[]> cands = new ArrayList<>();
+            walkIfd(ch, size, bo, u32(head, 4, bo), 0, true, cands, new int[]{1}, new HashSet<Long>());
+            int bw = 0, bh = 0;
+            for (long[] c : cands) {
+                if (c[1] < 500 || c[0] + c[1] > size) continue;
+                byte[] jpg = readAt(ch, c[0], (int) Math.min(c[1], 256 * 1024));
+                BitmapFactory.Options o = new BitmapFactory.Options();
+                o.inJustDecodeBounds = true;
+                BitmapFactory.decodeByteArray(jpg, 0, jpg.length, o);
+                if ((long) o.outWidth * o.outHeight > (long) bw * bh) { bw = o.outWidth; bh = o.outHeight; }
+            }
+            return bw > 0 ? new int[]{bw, bh} : null;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private static Bitmap decodeJpegSampled(byte[] jpg, int mx, int target, boolean lowMem) {
         int sample = 1;
         while (mx / (sample * 2) >= target) sample *= 2;
         BitmapFactory.Options o = new BitmapFactory.Options();
         o.inSampleSize = sample;
+        if (lowMem) o.inPreferredConfig = Bitmap.Config.RGB_565;
         return BitmapFactory.decodeByteArray(jpg, 0, jpg.length, o);
     }
 

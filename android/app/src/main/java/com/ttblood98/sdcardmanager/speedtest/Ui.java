@@ -221,6 +221,33 @@ final class Ui {
         return t;
     }
 
+    /** A FrameLayout that is always as tall as it is wide (for grid tiles). */
+    static final class Square extends android.widget.FrameLayout {
+        Square(Context c) { super(c); }
+
+        @Override protected void onMeasure(int w, int h) { super.onMeasure(w, w); }
+    }
+
+    /** Lays tiles out in rows of {@code cols} equal-width columns. */
+    LinearLayout grid(java.util.List<View> tiles, int cols, int gapDp) {
+        LinearLayout g = vbox();
+        int gap = px(gapDp);
+        for (int i = 0; i < tiles.size(); i += cols) {
+            LinearLayout row = hbox();
+            row.setGravity(Gravity.TOP);
+            for (int c = 0; c < cols; c++) {
+                View t = i + c < tiles.size() ? tiles.get(i + c) : new View(this.c);
+                LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(0, WRAP, 1f);
+                p.setMargins(c == 0 ? 0 : gap / 2, 0, c == cols - 1 ? 0 : gap / 2, 0);
+                row.addView(t, p);
+            }
+            LinearLayout.LayoutParams rp = lp(MATCH, WRAP);
+            rp.setMargins(0, i == 0 ? 0 : gap, 0, 0);
+            g.addView(row, rp);
+        }
+        return g;
+    }
+
     static String fmtSize(long n) {
         if (n >= 1073741824L) return String.format(java.util.Locale.US, "%.2f GB", n / 1073741824.0);
         if (n >= 1048576L) return String.format(java.util.Locale.US, "%.1f MB", n / 1048576.0);

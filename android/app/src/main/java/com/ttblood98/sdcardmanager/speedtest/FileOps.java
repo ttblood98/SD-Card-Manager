@@ -89,6 +89,40 @@ final class FileOps {
         return out;
     }
 
+    /** What is directly inside a folder: sub-folders ({documentId, name}, by name) and photos (newest first). */
+    static final class Children {
+        final List<String[]> folders = new ArrayList<>();
+        final List<Item> photos = new ArrayList<>();
+    }
+
+    static Children listChildren(ContentResolver cr, Uri tree, String docId) {
+        Children out = new Children();
+        Uri children = DocumentsContract.buildChildDocumentsUriUsingTree(tree, docId);
+        String[] proj = {DocumentsContract.Document.COLUMN_DOCUMENT_ID, DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+                DocumentsContract.Document.COLUMN_MIME_TYPE, DocumentsContract.Document.COLUMN_SIZE,
+                DocumentsContract.Document.COLUMN_LAST_MODIFIED};
+        try (Cursor c = cr.query(children, proj, null, null, null)) {
+            while (c != null && c.moveToNext()) {
+                String name = c.getString(1);
+                if (name == null || name.startsWith(".")) continue;
+                if (DocumentsContract.Document.MIME_TYPE_DIR.equals(c.getString(2))) {
+                    out.folders.add(new String[]{c.getString(0), name});
+                } else if (Item.typeOf(name) != Item.T_OTHER) {
+                    Item e = new Item();
+                    e.name = name;
+                    e.uri = DocumentsContract.buildDocumentUriUsingTree(tree, c.getString(0));
+                    e.size = c.isNull(3) ? 0 : c.getLong(3);
+                    e.mtime = c.isNull(4) ? 0 : c.getLong(4);
+                    e.type = Item.typeOf(name);
+                    out.photos.add(e);
+                }
+            }
+        }
+        Collections.sort(out.folders, (a, b) -> a[1].compareToIgnoreCase(b[1]));
+        Collections.sort(out.photos, (a, b) -> Long.compare(b.mtime, a.mtime));
+        return out;
+    }
+
     /** Creates a folder (or returns the existing one with that name). Returns its document id. */
     static String createFolder(ContentResolver cr, Uri tree, String parentDocId, String name) throws IOException {
         for (String[] f : listFolders(cr, tree, parentDocId)) if (f[1].equals(name)) return f[0];

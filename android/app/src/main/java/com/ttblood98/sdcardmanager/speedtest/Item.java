@@ -9,8 +9,8 @@ import java.util.Set;
 
 /** One file on the card. */
 final class Item {
-    static final int T_RAW = 0, T_JPG = 1, T_PNG = 2, T_OTHER = 3;
-    static final String[] TYPE_NAMES = {"RAW", "JPEG", "PNG", "Other"};
+    static final int T_RAW = 0, T_JPG = 1, T_OTHER = 2;
+    static final String[] TYPE_NAMES = {"RAW", "JPEG", "Other"};
     private static final Set<String> RAW_EXT = new HashSet<>(Arrays.asList(
             "nef", "nrw", "dng", "cr2", "cr3", "crw", "arw", "raf", "orf", "rw2", "pef", "srw", "x3f", "raw"));
 
@@ -28,12 +28,13 @@ final class Item {
         return i > 0 ? name.substring(i + 1).toUpperCase(Locale.ROOT) : "";
     }
 
+    boolean isPhoto() { return type != T_OTHER; }
+
     static int typeOf(String name) {
         int i = name.lastIndexOf('.');
         String x = i > 0 ? name.substring(i + 1).toLowerCase(Locale.ROOT) : "";
         if (RAW_EXT.contains(x)) return T_RAW;
         if (x.equals("jpg") || x.equals("jpeg")) return T_JPG;
-        if (x.equals("png")) return T_PNG;
         return T_OTHER;
     }
 }

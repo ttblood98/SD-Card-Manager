@@ -21,11 +21,14 @@ The test never touches your photos; it only deletes its own copies and one temp 
 The `android/` folder holds a native Android app. It replaced the web page on Android, where folder access is far
 too slow (a native scan of 580 files takes about 0.1 s; the browser took about 2 minutes).
 
-- **Gallery:** browse the card grouped by day, filter by type (RAW / JPEG / PNG / other) and date, sort.
+- **Gallery:** browse the card grouped by day, filter by type (RAW / JPEG / other) and date (dropdown), sort (top bar).
+  Pinch to change the grid: spread fingers for more, smaller thumbnails; pinch for fewer, bigger ones.
+- **Viewer:** swipe between photos, pinch or double-tap to zoom, see resolution, camera, lens and exposure.
 - **Selecting:** tap a photo to view it full screen; long-press to start selecting, and keep your finger down and drag
   to select a range (the list scrolls at the edges). Each day has a Select button.
-- **Copy / Move:** pick the destination in the app's own folder browser (recent folders, new folder). Every copy is
-  read back and checked; Move deletes an original only after its copy verifies.
+- **Copy / Move:** pick the destination album in the app's own album browser: album tiles with cached cover photos and
+  counts, recent albums, a preview of what is already inside, New album. Every copy is read back and checked; Move
+  deletes an original only after its copy verifies.
 - **Settings (gear icon):** card folder, destination folders (added once with Android's picker), date folders,
   grid size, activity log.
 

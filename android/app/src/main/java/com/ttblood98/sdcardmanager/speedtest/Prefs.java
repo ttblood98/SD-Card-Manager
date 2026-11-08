@@ -16,7 +16,7 @@ final class Prefs {
     // keys from earlier versions are kept so existing installs keep their folders
     private static final String K_CARD = "src_tree_v2", K_OLD_DST = "dst_tree_v2", K_ROOTS = "dest_roots_v3",
             K_RECENT = "dest_recent_v3", K_DATE_FOLDERS = "date_folders", K_COLUMNS = "grid_columns", K_SORT = "sort",
-            K_TYPES = "types";
+            K_TYPES = "types_v2";
 
     /** A destination folder: a granted tree, a folder inside it, and a readable path for display. */
     static final class Dest {
@@ -138,7 +138,7 @@ final class Prefs {
 
     void setDateFolders(boolean b) { p.edit().putBoolean(K_DATE_FOLDERS, b).apply(); }
 
-    int columns() { return p.getInt(K_COLUMNS, 4); }
+    int columns() { return Math.max(2, Math.min(7, p.getInt(K_COLUMNS, 4))); }
 
     void setColumns(int n) { p.edit().putInt(K_COLUMNS, n).apply(); }
 
@@ -147,9 +147,9 @@ final class Prefs {
     void setSort(int s) { p.edit().putInt(K_SORT, s).apply(); }
 
     boolean[] types() {
-        String s = p.getString(K_TYPES, "1111");
-        boolean[] t = new boolean[4];
-        for (int i = 0; i < 4; i++) t[i] = i < s.length() && s.charAt(i) == '1';
+        String s = p.getString(K_TYPES, "111");
+        boolean[] t = new boolean[3];
+        for (int i = 0; i < 3; i++) t[i] = i < s.length() && s.charAt(i) == '1';
         return t;
     }
 

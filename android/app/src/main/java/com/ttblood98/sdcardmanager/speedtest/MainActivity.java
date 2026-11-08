@@ -24,7 +24,6 @@ import android.view.WindowManager;
 import android.widget.AbsListView;
 import android.widget.BaseAdapter;
 import android.widget.FrameLayout;
-import android.widget.HorizontalScrollView;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ListView;
@@ -55,7 +54,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * SD Importer: a gallery of the camera card. Tap to view, long-press (and drag) to select, then Copy or Move to a
  * destination chosen in the in-app folder picker. Settings hold the one-time setup (card folder, destination folders).
  */
-public class MainActivity extends Activity implements Thumbs.Listener {
+public class MainActivity extends Activity {
     static final int REQ_CARD = 1, REQ_ROOT = 2;
     static final String[] SORT_NAMES = {"Newest first", "Oldest first", "Name A-Z", "Largest first"};
 
@@ -72,6 +71,7 @@ public class MainActivity extends Activity implements Thumbs.Listener {
     Ui ui;
     Prefs prefs;
     Thumbs thumbs;
+    Covers covers;
     final Handler h = new Handler(Looper.getMainLooper());
     final ExecutorService bg = Executors.newSingleThreadExecutor();
     private final StringBuilder report = new StringBuilder();
@@ -96,8 +96,8 @@ public class MainActivity extends Activity implements Thumbs.Listener {
     private FrameLayout overlay;
 
     // gallery views
-    private TextView title, subtitle, closeSel, selAllBtn, refreshBtn, settingsBtn, bottomInfo, dateChip, sortChip;
-    private final TextView[] typeChips = new TextView[4];
+    private TextView title, subtitle, closeSel, selAllBtn, sortBtn, settingsBtn, bottomInfo, dateChip;
+    private final TextView[] typeChips = new TextView[3];
     private DragListView list;
     private RowsAdapter adapter;
     private LinearLayout emptyBox, bottomBar;
@@ -110,7 +110,8 @@ public class MainActivity extends Activity implements Thumbs.Listener {
         setTheme(ui.night ? android.R.style.Theme_Material_NoActionBar : android.R.style.Theme_Material_Light_NoActionBar);
         super.onCreate(b);
         prefs = new Prefs(this);
-        thumbs = new Thumbs(getContentResolver(), h, this::log, this);
+        thumbs = new Thumbs(getContentResolver(), h, this::log);
+        covers = new Covers(this);
         types = prefs.types();
         sort = prefs.sort();
 
@@ -144,6 +145,7 @@ public class MainActivity extends Activity implements Thumbs.Listener {
     protected void onDestroy() {
         super.onDestroy();
         thumbs.shutdown();
+        covers.shutdown();
         bg.shutdownNow();
     }
 
@@ -366,7 +368,7 @@ public class MainActivity extends Activity implements Thumbs.Listener {
     }
 
     private void resetFilters() {
-        for (int i = 0; i < 4; i++) types[i] = true;
+        for (int i = 0; i < 3; i++) types[i] = true;
         prefs.setTypes(types);
         dateFrom = 0;
         dateTo = Long.MAX_VALUE;
@@ -385,19 +387,33 @@ public class MainActivity extends Activity implements Thumbs.Listener {
     }
 
     private void chooseDate() {
-        final String[] opts = {"All dates", "Today", "Last 3 days", "Last 7 days", "Last 30 days", "Pick a date range..."};
-        new AlertDialog.Builder(this).setTitle("Show photos from").setItems(opts, (d, which) -> {
+        final String[] opts = {"All dates", "Today", "Yesterday", "Last 3 days", "Last 7 days", "Last 30 days", "Pick dates…"};
+        android.widget.PopupMenu pm = new android.widget.PopupMenu(this, dateChip);
+        for (int i = 0; i < opts.length; i++) {
+            android.view.MenuItem mi = pm.getMenu().add(0, i, i, opts[i]);
+            mi.setChecked(opts[i].equals(dateLabel));
+        }
+        pm.getMenu().setGroupCheckable(0, true, true);
+        pm.setOnMenuItemClickListener(item -> {
             Calendar c = Calendar.getInstance();
             startOfDay(c);
-            switch (which) {
+            switch (item.getItemId()) {
                 case 0: setRange(0, Long.MAX_VALUE, "All dates"); break;
                 case 1: setRange(c.getTimeInMillis(), Long.MAX_VALUE, "Today"); break;
-                case 2: c.add(Calendar.DAY_OF_YEAR, -2); setRange(c.getTimeInMillis(), Long.MAX_VALUE, "Last 3 days"); break;
-                case 3: c.add(Calendar.DAY_OF_YEAR, -6); setRange(c.getTimeInMillis(), Long.MAX_VALUE, "Last 7 days"); break;
-                case 4: c.add(Calendar.DAY_OF_YEAR, -29); setRange(c.getTimeInMillis(), Long.MAX_VALUE, "Last 30 days"); break;
+                case 2: {
+                    long end = c.getTimeInMillis() - 1;
+                    c.add(Calendar.DAY_OF_YEAR, -1);
+                    setRange(c.getTimeInMillis(), end, "Yesterday");
+                    break;
+                }
+                case 3: c.add(Calendar.DAY_OF_YEAR, -2); setRange(c.getTimeInMillis(), Long.MAX_VALUE, "Last 3 days"); break;
+                case 4: c.add(Calendar.DAY_OF_YEAR, -6); setRange(c.getTimeInMillis(), Long.MAX_VALUE, "Last 7 days"); break;
+                case 5: c.add(Calendar.DAY_OF_YEAR, -29); setRange(c.getTimeInMillis(), Long.MAX_VALUE, "Last 30 days"); break;
                 default: pickCustomRange();
             }
-        }).show();
+            return true;
+        });
+        pm.show();
     }
 
     private static void startOfDay(Calendar c) {
@@ -483,11 +499,6 @@ public class MainActivity extends Activity implements Thumbs.Listener {
         }
     }
 
-    @Override
-    public void onThumbsChanged() {
-        if (adapter != null) adapter.notifyDataSetChanged();
-    }
-
     // ================================================================== gallery UI
 
     private View buildGallery() {
@@ -499,38 +510,37 @@ public class MainActivity extends Activity implements Thumbs.Listener {
         title = ui.text("SD Importer", 20, ui.text, true);
         subtitle = ui.text("", 13, ui.textDim, false);
         selAllBtn = ui.flatButton("Select all", v -> selectAllShown());
-        refreshBtn = ui.iconButton("⟳", "Rescan card", v -> startScan());
+        sortBtn = ui.iconButton("⇅", "Sort", v -> chooseSort());
         settingsBtn = ui.iconButton("⚙", "Settings", v -> pushPage(new SettingsPage()));
         bar.addView(closeSel);
         LinearLayout tb = ui.titleBlock(title, subtitle);
         tb.setPadding(ui.px(12), 0, ui.px(8), 0);
         bar.addView(tb);
         bar.addView(selAllBtn);
-        bar.addView(refreshBtn);
+        bar.addView(sortBtn);
         bar.addView(settingsBtn);
         root.addView(bar, Ui.lp(Ui.MATCH, Ui.WRAP));
 
-        HorizontalScrollView hs = new HorizontalScrollView(this);
-        hs.setHorizontalScrollBarEnabled(false);
-        hs.setBackgroundColor(ui.bg);
         LinearLayout chips = ui.hbox();
+        chips.setBackgroundColor(ui.bg);
         chips.setPadding(ui.px(12), ui.px(10), ui.px(12), ui.px(6));
-        for (int i = 0; i < 4; i++) {
+        for (int i = 0; i < 3; i++) {
             final int t = i;
             typeChips[i] = ui.chip(Item.TYPE_NAMES[i], v -> toggleType(t));
             chips.addView(typeChips[i]);
         }
-        View sep = new View(this);
-        sep.setBackgroundColor(ui.divider);
-        LinearLayout.LayoutParams sp = new LinearLayout.LayoutParams(ui.px(1), ui.px(24));
-        sp.setMargins(ui.px(2), 0, ui.px(10), 0);
-        chips.addView(sep, sp);
-        dateChip = ui.chip("All dates", v -> chooseDate());
-        sortChip = ui.chip(SORT_NAMES[0], v -> chooseSort());
-        chips.addView(dateChip);
-        chips.addView(sortChip);
-        hs.addView(chips);
-        root.addView(hs, Ui.lp(Ui.MATCH, Ui.WRAP));
+        dateChip = ui.text("All dates", 14, ui.text, false);
+        dateChip.setSingleLine(true);
+        dateChip.setEllipsize(android.text.TextUtils.TruncateAt.END);
+        dateChip.setGravity(Gravity.CENTER_VERTICAL);
+        dateChip.setMinHeight(ui.px(36));
+        dateChip.setPadding(ui.px(12), 0, ui.px(10), 0);
+        dateChip.setOnClickListener(v -> chooseDate());
+        dateChip.setContentDescription("Date filter");
+        LinearLayout.LayoutParams dlp = new LinearLayout.LayoutParams(0, ui.px(36), 1f);
+        dlp.setMargins(ui.px(2), 0, 0, 0);
+        chips.addView(dateChip, dlp);
+        root.addView(chips, Ui.lp(Ui.MATCH, Ui.WRAP));
 
         FrameLayout content = new FrameLayout(this);
         list = new DragListView(this);
@@ -576,7 +586,7 @@ public class MainActivity extends Activity implements Thumbs.Listener {
         closeSel.setVisibility(sel ? View.VISIBLE : View.GONE);
         selAllBtn.setVisibility(sel ? View.VISIBLE : View.GONE);
         selAllBtn.setText(n == shown.size() ? "Select none" : "Select all");
-        refreshBtn.setVisibility(sel ? View.GONE : View.VISIBLE);
+        sortBtn.setVisibility(sel ? View.GONE : View.VISIBLE);
         settingsBtn.setVisibility(sel ? View.GONE : View.VISIBLE);
         bottomBar.setVisibility(sel ? View.VISIBLE : View.GONE);
         if (sel) {
@@ -590,11 +600,11 @@ public class MainActivity extends Activity implements Thumbs.Listener {
             else if (shown.size() == items.size()) subtitle.setText(items.size() + " files · " + Ui.fmtSize(shownBytes));
             else subtitle.setText(shown.size() + " of " + items.size() + " files · " + Ui.fmtSize(shownBytes));
         }
-        for (int i = 0; i < 4; i++) ui.setChip(typeChips[i], types[i]);
-        dateChip.setText(dateLabel);
-        ui.setChip(dateChip, dateFrom != 0 || dateTo != Long.MAX_VALUE);
-        sortChip.setText(SORT_NAMES[sort]);
-        ui.setChip(sortChip, false);
+        for (int i = 0; i < 3; i++) ui.setChip(typeChips[i], types[i]);
+        boolean dated = dateFrom != 0 || dateTo != Long.MAX_VALUE;
+        dateChip.setText("📅  " + dateLabel + "  ▾");
+        dateChip.setTextColor(dated ? ui.onAccent : ui.text);
+        dateChip.setBackground(ui.ripple(ui.round(dated ? ui.accent : ui.surface, 10, dated ? 0 : ui.divider), ui.rippleColor()));
         updateEmpty();
     }
 
@@ -823,7 +833,30 @@ public class MainActivity extends Activity implements Thumbs.Listener {
         private float lastX, lastY;
         private final Runnable tick = this::autoScrollTick;
 
-        DragListView(Context c) { super(c); }
+        private final android.view.ScaleGestureDetector pinch;
+        private boolean pinching, pinchCancelSent;
+        private float pinchAcc = 1f;
+
+        DragListView(Context c) {
+            super(c);
+            pinch = new android.view.ScaleGestureDetector(c, new android.view.ScaleGestureDetector.SimpleOnScaleGestureListener() {
+                @Override public boolean onScaleBegin(android.view.ScaleGestureDetector d) {
+                    pinching = true;
+                    pinchAcc = 1f;
+                    return true;
+                }
+
+                @Override public boolean onScale(android.view.ScaleGestureDetector d) {
+                    pinchAcc *= d.getScaleFactor();
+                    // spreading fingers = more (smaller) thumbnails; pinching = fewer (bigger)
+                    if (pinchAcc > 1.3f) { changeColumns(+1); pinchAcc = 1f; }
+                    else if (pinchAcc < 0.77f) { changeColumns(-1); pinchAcc = 1f; }
+                    return true;
+                }
+
+                @Override public void onScaleEnd(android.view.ScaleGestureDetector d) { pinching = false; }
+            });
+        }
 
         void startDrag(int idx) {
             if (idx < 0 || idx >= shown.size()) return;
@@ -845,7 +878,23 @@ public class MainActivity extends Activity implements Thumbs.Listener {
 
         @Override
         public boolean dispatchTouchEvent(MotionEvent ev) {
-            if (!dragging) return super.dispatchTouchEvent(ev);
+            if (!dragging) {
+                int act = ev.getActionMasked();
+                if (act == MotionEvent.ACTION_DOWN) pinchCancelSent = false;
+                pinch.onTouchEvent(ev);
+                if (pinching || ev.getPointerCount() > 1 || pinchCancelSent) {
+                    if (!pinchCancelSent) {
+                        MotionEvent cancelEv = MotionEvent.obtain(ev);
+                        cancelEv.setAction(MotionEvent.ACTION_CANCEL);
+                        super.dispatchTouchEvent(cancelEv);
+                        cancelEv.recycle();
+                        pinchCancelSent = true;
+                    }
+                    if (act == MotionEvent.ACTION_UP || act == MotionEvent.ACTION_CANCEL) { pinchCancelSent = false; pinching = false; }
+                    return true;
+                }
+                return super.dispatchTouchEvent(ev);
+            }
             int a = ev.getActionMasked();
             lastX = ev.getX();
             lastY = ev.getY();
@@ -909,6 +958,29 @@ public class MainActivity extends Activity implements Thumbs.Listener {
             lastIdx = idx;
             onSelectionChanged();
         }
+    }
+
+    /** Pinch on the gallery: +1 = more columns (smaller thumbnails), -1 = fewer. Keeps the same photos in view. */
+    private void changeColumns(int delta) {
+        int cols = prefs.columns(), n = Math.max(2, Math.min(7, cols + delta));
+        if (n == cols) return;
+        int firstItem = -1;
+        int pos = list.getFirstVisiblePosition();
+        for (int i = pos; i < rows.size() && firstItem < 0; i++) {
+            Object r = rows.get(i);
+            if (r instanceof TileRow) firstItem = ((TileRow) r).start;
+            else if (r instanceof Header) firstItem = ((Header) r).start;
+        }
+        prefs.setColumns(n);
+        rebuildRows();
+        adapter.notifyDataSetChanged();
+        if (firstItem >= 0) {
+            for (int i = 0; i < rows.size(); i++) {
+                Object r = rows.get(i);
+                if (r instanceof TileRow && ((TileRow) r).start + ((TileRow) r).count > firstItem) { list.setSelection(i); break; }
+            }
+        }
+        list.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK);
     }
 
     // ================================================================== copy / move
@@ -990,6 +1062,7 @@ public class MainActivity extends Activity implements Thumbs.Listener {
                 transferring = false;
                 thumbs.paused = false;
                 getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                covers.invalidateAll();
                 if (!r.moved.isEmpty()) items.removeAll(r.moved);
                 for (Item e : todo) e.selected = false;
                 applyFilter();
@@ -1233,11 +1306,11 @@ public class MainActivity extends Activity implements Thumbs.Listener {
 
             body.addView(ui.sectionHeader("Gallery"));
             LinearLayout c4 = card();
-            c4.addView(ui.listRow("▦", "Grid columns", String.valueOf(prefs.columns()), null, v -> {
-                final String[] opts = {"3", "4", "5", "6"};
+            c4.addView(ui.listRow("▦", "Grid columns", prefs.columns() + "  (you can also pinch the gallery)", null, v -> {
+                final String[] opts = {"2", "3", "4", "5", "6", "7"};
                 new AlertDialog.Builder(MainActivity.this).setTitle("Grid columns")
-                        .setSingleChoiceItems(opts, prefs.columns() - 3, (d, which) -> {
-                            prefs.setColumns(which + 3);
+                        .setSingleChoiceItems(opts, prefs.columns() - 2, (d, which) -> {
+                            prefs.setColumns(which + 2);
                             applyFilter();
                             refresh();
                             d.dismiss();
