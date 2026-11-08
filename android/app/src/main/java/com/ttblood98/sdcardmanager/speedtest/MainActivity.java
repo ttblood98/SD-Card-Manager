@@ -962,40 +962,51 @@ public class MainActivity extends Activity {
         }
     }
 
-    // ---- pinch-to-resize: the old and new grid cross-fade and zoom following the fingers.
+    // ---- pinch-to-resize, following the fingers.
+    // The current grid is frozen as a picture on top; the new column count is laid out underneath at full opacity.
+    // Both scale exactly with the fingers; the picture fades out over a short stretch in the middle, so one grid
+    // replaces the other instead of the two blending. Direction is locked per pinch so finger jitter can't flip it.
     // Spreading = fewer, bigger thumbnails; pinching = more, smaller. Release past halfway to keep the change.
 
     private ImageView gridSnapshot;
-    private int pinchFrom = 0, pinchTo = 0, pinchFirstItem = -1;
-    private float pinchBase = 1f, pinchP = 0f, pinchFx, pinchFy;
+    private android.graphics.Bitmap snapBitmap;
+    private int pinchFrom = 0, pinchTo = 0, pinchFirstItem = -1, pinchDir = 0;
+    private float pinchBase = 1f, pinchEff = 1f, pinchFx, pinchFy;
     private android.animation.ValueAnimator pinchAnim;
 
     private void pinchBegin() {
         if (pinchAnim != null) pinchAnim.end();
         pinchBase = 1f;
         pinchTo = 0;
-        pinchP = 0f;
+        pinchDir = 0;
+        pinchEff = 1f;
+    }
+
+    private float pinchRatio() { return pinchFrom / (float) pinchTo; }  // > 1 when thumbnails get bigger
+
+    private float pinchProgress(float eff) {
+        float ratio = pinchRatio();
+        float p = ratio > 1 ? (eff - 1f) / (ratio - 1f) : (1f - eff) / (1f - ratio);
+        return Math.max(0f, Math.min(1f, p));
     }
 
     private void pinchUpdate(float cum, float fx, float fy) {
-        pinchFx = fx;
-        pinchFy = fy;
-        float rel = cum / pinchBase;
         if (pinchTo == 0) {
-            if (rel > 1.04f) startPinchStep(-1);
-            else if (rel < 0.96f) startPinchStep(+1);
+            pinchFx = fx;
+            pinchFy = fy;
+            float rel = cum / pinchBase;
+            int dir = rel > 1.06f ? -1 : rel < 0.94f ? +1 : 0;  // -1 = fewer columns
+            if (dir == 0 || (pinchDir != 0 && dir != pinchDir)) return;
+            pinchDir = dir;
+            pinchBase = cum;  // the frozen grid starts at exactly its current size: no jump
+            startPinchStep(dir);
             if (pinchTo == 0) return;
         }
-        float ratio = pinchFrom / (float) pinchTo;  // > 1 when thumbnails get bigger
-        float p = ratio > 1 ? (rel - 1f) / (ratio - 1f) : (1f - rel) / (1f - ratio);
-        if (p < -0.2f) {  // fingers went back past the start and beyond: switch direction
-            abortPinchStep();
-            pinchUpdate(cum, fx, fy);
-            return;
-        }
-        setPinchProgress(Math.max(0f, Math.min(1f, p)));
-        boolean overshoot = ratio > 1 ? rel > ratio * 1.12f : rel < ratio / 1.12f;
-        if (p >= 1f && overshoot) {  // kept going: lock this step in and start the next one
+        float eff = cum / pinchBase;
+        setPinchEff(eff);
+        float ratio = pinchRatio();
+        boolean beyond = ratio > 1 ? eff > ratio * 1.1f : eff < ratio / 1.1f;
+        if (beyond) {  // kept going: lock this step in; the next one starts from here
             commitPinchStep();
             pinchBase = cum;
         }
@@ -1003,11 +1014,15 @@ public class MainActivity extends Activity {
 
     private void pinchEnd() {
         if (pinchTo == 0) return;
-        final boolean keep = pinchP >= 0.5f;
-        pinchAnim = android.animation.ValueAnimator.ofFloat(pinchP, keep ? 1f : 0f);
-        pinchAnim.setDuration((long) (80 + 200 * Math.abs((keep ? 1f : 0f) - pinchP)));
-        pinchAnim.setInterpolator(new android.view.animation.DecelerateInterpolator());
-        pinchAnim.addUpdateListener(an -> setPinchProgress((float) an.getAnimatedValue()));
+        final boolean keep = pinchProgress(pinchEff) >= 0.5f;
+        float target = keep ? pinchRatio() : 1f;
+        float clamped = pinchRatio() > 1 ? Math.max(1f, Math.min(pinchRatio(), pinchEff))
+                : Math.min(1f, Math.max(pinchRatio(), pinchEff));
+        pinchAnim = android.animation.ValueAnimator.ofFloat(clamped, target);
+        float dist = Math.abs(pinchProgress(clamped) - (keep ? 1f : 0f));
+        pinchAnim.setDuration((long) (90 + 170 * dist));
+        pinchAnim.setInterpolator(new android.view.animation.DecelerateInterpolator(1.5f));
+        pinchAnim.addUpdateListener(an -> setPinchEff((float) an.getAnimatedValue()));
         pinchAnim.addListener(new android.animation.AnimatorListenerAdapter() {
             private boolean done;
 
@@ -1045,17 +1060,18 @@ public class MainActivity extends Activity {
         if (to == from || list.getWidth() == 0 || list.getHeight() == 0) { pinchTo = 0; return; }
         FrameLayout parent = (FrameLayout) list.getParent();
         removeGridSnapshot();
-        list.setAlpha(1f);
-        list.setScaleX(1f);
-        list.setScaleY(1f);
+        resetListTransform();
         try {
-            android.graphics.Bitmap snap = android.graphics.Bitmap.createBitmap(list.getWidth(), list.getHeight(),
-                    android.graphics.Bitmap.Config.ARGB_8888);
-            android.graphics.Canvas cv = new android.graphics.Canvas(snap);
+            if (snapBitmap == null || snapBitmap.getWidth() != list.getWidth() || snapBitmap.getHeight() != list.getHeight()) {
+                snapBitmap = android.graphics.Bitmap.createBitmap(list.getWidth(), list.getHeight(),
+                        android.graphics.Bitmap.Config.ARGB_8888);
+            }
+            android.graphics.Canvas cv = new android.graphics.Canvas(snapBitmap);
             cv.drawColor(ui.bg);
             list.draw(cv);
             gridSnapshot = new ImageView(this);
-            gridSnapshot.setImageBitmap(snap);
+            gridSnapshot.setImageBitmap(snapBitmap);
+            gridSnapshot.setBackgroundColor(ui.bg);
             parent.addView(gridSnapshot, 1, new FrameLayout.LayoutParams(Ui.MATCH, Ui.MATCH));
         } catch (Throwable t) {
             pinchTo = 0;
@@ -1068,34 +1084,41 @@ public class MainActivity extends Activity {
         rebuildRows();
         adapter.notifyDataSetChanged();
         scrollToItem(pinchFirstItem);
-        setPinchProgress(0f);
+        setPinchEff(1f);
     }
 
-    private void setPinchProgress(float p) {
-        pinchP = p;
+    private static float smooth(float a, float b, float x) {
+        float t = Math.max(0f, Math.min(1f, (x - a) / (b - a)));
+        return t * t * (3f - 2f * t);
+    }
+
+    /** eff = finger distance relative to where this step started (1 = start, ratio = finished). */
+    private void setPinchEff(float eff) {
+        pinchEff = eff;
         if (pinchTo == 0) return;
-        float ratio = pinchFrom / (float) pinchTo;
+        float ratio = pinchRatio();
+        // follow the fingers, with a little give past either end
+        float lo = Math.min(1f, ratio), hi = Math.max(1f, ratio);
+        float e = eff < lo ? lo - (lo - eff) * 0.25f : eff > hi ? hi + (eff - hi) * 0.25f : eff;
+        float p = pinchProgress(e);
         if (gridSnapshot != null) {
             gridSnapshot.setPivotX(pinchFx);
             gridSnapshot.setPivotY(pinchFy);
-            float s1 = 1f + (ratio - 1f) * p;
-            gridSnapshot.setScaleX(s1);
-            gridSnapshot.setScaleY(s1);
-            gridSnapshot.setAlpha(1f - p);
+            gridSnapshot.setScaleX(e);
+            gridSnapshot.setScaleY(e);
+            gridSnapshot.setAlpha(1f - smooth(0.3f, 0.7f, p));
         }
         list.setPivotX(pinchFx);
         list.setPivotY(pinchFy);
-        float s2 = 1f / ratio + (1f - 1f / ratio) * p;
-        list.setScaleX(s2);
-        list.setScaleY(s2);
-        list.setAlpha(p);
+        list.setScaleX(e / ratio);
+        list.setScaleY(e / ratio);
+        list.setAlpha(1f);
     }
 
     private void commitPinchStep() {
         prefs.setColumns(pinchTo);
         gridCols = -1;
         pinchTo = 0;
-        pinchP = 0f;
         removeGridSnapshot();
         resetListTransform();
         list.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK);
@@ -1104,7 +1127,6 @@ public class MainActivity extends Activity {
     private void abortPinchStep() {
         gridCols = -1;
         pinchTo = 0;
-        pinchP = 0f;
         rebuildRows();
         adapter.notifyDataSetChanged();
         scrollToItem(pinchFirstItem);
