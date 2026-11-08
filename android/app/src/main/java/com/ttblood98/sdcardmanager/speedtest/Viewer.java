@@ -370,6 +370,7 @@ final class Viewer implements MainActivity.Page {
             cam.append(m);
         }
         String lens = x.getAttribute("LensModel");
+        if (lens == null || lens.trim().isEmpty()) lens = Thumbs.lensModel(a.getContentResolver(), e.uri);  // ExifInterface lacks this tag
         if (lens != null && !lens.trim().isEmpty()) cam.append(cam.length() > 0 ? DOT : "").append(lens.trim());
 
         StringBuilder exp = new StringBuilder();

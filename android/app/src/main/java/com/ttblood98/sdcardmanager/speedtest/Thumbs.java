@@ -302,6 +302,73 @@ final class Thumbs {
         }
     }
 
+    /**
+     * The lens name (EXIF LensModel, tag 0xA434) read straight from the file. Android's ExifInterface doesn't know
+     * this tag, so it is parsed here: works for JPEG (APP1 Exif) and TIFF-based RAW files such as NEF.
+     */
+    static String lensModel(ContentResolver cr, Uri uri) {
+        try (ParcelFileDescriptor pfd = cr.openFileDescriptor(uri, "r")) {
+            if (pfd == null) return null;
+            FileChannel ch = new FileInputStream(pfd.getFileDescriptor()).getChannel();
+            long size = ch.size();
+            long base = tiffBase(ch, size);
+            if (base < 0) return null;
+            byte[] h = readAt(ch, base, 8);
+            if (h.length < 8) return null;
+            ByteOrder bo = h[0] == 0x49 ? ByteOrder.LITTLE_ENDIAN : ByteOrder.BIG_ENDIAN;
+            if (u16(h, 2, bo) != 42) return null;
+            long[] exif = findTag(ch, size, bo, base + u32(h, 4, bo), 0x8769);
+            if (exif == null) return null;
+            long[] lens = findTag(ch, size, bo, base + exif[2], 0xA434);
+            if (lens == null || lens[0] != 2 || lens[1] <= 0 || lens[1] > 512) return null;
+            byte[] b = lens[1] <= 4 ? readAt(ch, lens[3] + 8, (int) lens[1]) : readAt(ch, base + lens[2], (int) lens[1]);
+            StringBuilder sb = new StringBuilder();
+            for (byte x : b) { if (x == 0) break; sb.append((char) (x & 0xff)); }
+            String out = sb.toString().trim();
+            return out.isEmpty() ? null : out;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /** Offset of the TIFF header: 0 for TIFF-based RAW files, inside the APP1 "Exif" segment for JPEG; -1 if none. */
+    private static long tiffBase(FileChannel ch, long size) throws IOException {
+        byte[] head = readAt(ch, 0, 4);
+        if (head.length < 4) return -1;
+        if ((head[0] == 0x49 && head[1] == 0x49) || (head[0] == 0x4d && head[1] == 0x4d)) return 0;
+        if ((head[0] & 0xff) != 0xff || (head[1] & 0xff) != 0xd8) return -1;
+        long p = 2;
+        for (int n = 0; n < 40 && p + 10 <= size; n++) {
+            byte[] m = readAt(ch, p, 10);
+            if (m.length < 10 || (m[0] & 0xff) != 0xff) return -1;
+            int marker = m[1] & 0xff, len = ((m[2] & 0xff) << 8) | (m[3] & 0xff);
+            if (marker == 0xe1 && m[4] == 'E' && m[5] == 'x' && m[6] == 'i' && m[7] == 'f') return p + 10;
+            if (marker == 0xda || marker == 0xd9) return -1;
+            p += 2 + len;
+        }
+        return -1;
+    }
+
+    /** Finds a tag in the IFD at absolute offset off: {type, count, value/offset, entry position}, or null. */
+    private static long[] findTag(FileChannel ch, long size, ByteOrder bo, long off, int want) throws IOException {
+        if (off <= 0 || off + 2 > size) return null;
+        byte[] cb = readAt(ch, off, 2);
+        if (cb.length < 2) return null;
+        int count = u16(cb, 0, bo);
+        if (count == 0 || count > 600) return null;
+        byte[] buf = readAt(ch, off + 2, count * 12);
+        if (buf.length < count * 12) return null;
+        for (int i = 0; i < count; i++) {
+            int o = i * 12;
+            if (u16(buf, o, bo) != want) continue;
+            int type = u16(buf, o + 2, bo);
+            long cnt = u32(buf, o + 4, bo);
+            long val = (type == 3 && cnt == 1) ? u16(buf, o + 8, bo) : u32(buf, o + 8, bo);
+            return new long[]{type, cnt, val, off + 2 + o};
+        }
+        return null;
+    }
+
     /** Width/height of the largest JPEG preview inside a RAW file (Nikon stores a full-size one), or null. */
     static int[] rawPreviewSize(ContentResolver cr, Uri uri) {
         try (ParcelFileDescriptor pfd = cr.openFileDescriptor(uri, "r")) {
