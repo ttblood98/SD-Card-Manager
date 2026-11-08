@@ -29,6 +29,7 @@ too slow (a native scan of 580 files takes about 0.1 s; the browser took about 2
 - **Copy / Move:** pick the destination album in the app's own album browser: album tiles with cached cover photos and
   counts, recent albums, a preview of what is already inside, New album. Every copy is read back and checked; Move
   deletes an original only after its copy verifies.
+- **Delete:** delete selected files (or the photo in the viewer) from the card, after a confirmation.
 - **Settings (gear icon):** card folder, destination folders (added once with Android's picker), date folders,
   grid size, activity log.
 

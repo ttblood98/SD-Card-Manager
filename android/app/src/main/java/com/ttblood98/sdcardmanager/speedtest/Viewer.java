@@ -68,6 +68,14 @@ final class Viewer implements MainActivity.Page {
         tcol.addView(title);
         tcol.addView(counter);
         top.addView(tcol, Ui.weight(1));
+        TextView trash = ui.iconButton("🗑", "Delete this photo", v -> {
+            if (index >= 0 && index < a.shown.size()) {
+                java.util.List<Item> one = new java.util.ArrayList<>();
+                one.add(a.shown.get(index));
+                a.confirmDelete(one);
+            }
+        });
+        top.addView(trash);
         selBtn = ui.text("", 14, 0xFFFFFFFF, true);
         selBtn.setGravity(Gravity.CENTER);
         selBtn.setPadding(ui.px(14), ui.px(8), ui.px(14), ui.px(8));

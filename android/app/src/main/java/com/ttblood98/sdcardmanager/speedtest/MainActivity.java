@@ -96,7 +96,7 @@ public class MainActivity extends Activity {
     private FrameLayout overlay;
 
     // gallery views
-    private TextView title, subtitle, closeSel, selAllBtn, sortBtn, settingsBtn, bottomInfo, dateChip;
+    private TextView title, subtitle, closeSel, selAllBtn, sortBtn, settingsBtn, dateChip;
     private final TextView[] typeChips = new TextView[3];
     private DragListView list;
     private RowsAdapter adapter;
@@ -562,15 +562,16 @@ public class MainActivity extends Activity {
         bottomBar = ui.hbox();
         bottomBar.setBackgroundColor(ui.surface);
         bottomBar.setElevation(ui.px(8));
-        bottomBar.setPadding(ui.px(16), ui.px(10), ui.px(12), ui.px(10));
-        bottomInfo = ui.text("", 14, ui.textDim, false);
-        bottomBar.addView(bottomInfo, Ui.weight(1));
+        bottomBar.setPadding(ui.px(12), ui.px(10), ui.px(12), ui.px(10));
+        TextView delBtn = ui.secondaryButton("🗑 Delete", v -> confirmDelete(selectedItems()));
+        delBtn.setTextColor(ui.danger);
         TextView copyBtn = ui.secondaryButton("Copy", v -> startTransferFlow(false));
         TextView moveBtn = ui.primaryButton("Move", v -> startTransferFlow(true));
-        LinearLayout.LayoutParams bp = Ui.lp(Ui.WRAP, Ui.WRAP);
+        bottomBar.addView(delBtn, Ui.weight(1.15f));
+        LinearLayout.LayoutParams bp = Ui.weight(1);
         bp.setMargins(ui.px(8), 0, 0, 0);
         bottomBar.addView(copyBtn, bp);
-        LinearLayout.LayoutParams bp2 = Ui.lp(Ui.WRAP, Ui.WRAP);
+        LinearLayout.LayoutParams bp2 = Ui.weight(1);
         bp2.setMargins(ui.px(8), 0, 0, 0);
         bottomBar.addView(moveBtn, bp2);
         root.addView(bottomBar, Ui.lp(Ui.MATCH, Ui.WRAP));
@@ -592,7 +593,6 @@ public class MainActivity extends Activity {
         if (sel) {
             title.setText(n + " selected");
             subtitle.setText(Ui.fmtSize(selBytes));
-            bottomInfo.setText(n + " file" + (n == 1 ? "" : "s") + " · " + Ui.fmtSize(selBytes));
         } else {
             title.setText("SD Importer");
             if (scanning && items.isEmpty()) subtitle.setText("Reading card…");
@@ -1016,6 +1016,7 @@ public class MainActivity extends Activity {
     private volatile int curIndex;
     private volatile String curName = "";
     private long totalBytes, startedAt;
+    private volatile boolean deleting = false;
     private int totalFiles;
     private final Runnable progressTick = new Runnable() {
         @Override public void run() {
@@ -1023,6 +1024,11 @@ public class MainActivity extends Activity {
             long done = doneBytes.get();
             pBar.setProgress(totalBytes > 0 ? (int) (done * 1000 / totalBytes) : 0);
             pLine1.setText(Math.min(curIndex, totalFiles) + " of " + totalFiles + " · " + curName);
+            if (deleting) {
+                pLine2.setText("Freed " + Ui.fmtSize(done) + " of " + Ui.fmtSize(totalBytes));
+                h.postDelayed(this, 150);
+                return;
+            }
             double secs = (SystemClock.elapsedRealtime() - startedAt) / 1000.0;
             double speed = secs > 0.3 ? done / 1048576.0 / secs : 0;
             String left = speed > 0.1 ? " · about " + fmtDuration((totalBytes - done) / 1048576.0 / speed) + " left" : "";
@@ -1147,6 +1153,10 @@ public class MainActivity extends Activity {
     }
 
     private void showProgressOverlay(boolean move) {
+        showProgressOverlay(move ? "Moving photos" : "Copying photos");
+    }
+
+    private void showProgressOverlay(String titleText) {
         overlay = new FrameLayout(this);
         overlay.setBackgroundColor(ui.scrim);
         overlay.setClickable(true);
@@ -1154,7 +1164,7 @@ public class MainActivity extends Activity {
         pCard.setBackground(ui.round(ui.surface, 24, 0));
         pCard.setPadding(ui.px(24), ui.px(24), ui.px(24), ui.px(20));
         pCard.setElevation(ui.px(12));
-        pTitle = ui.text(move ? "Moving photos" : "Copying photos", 20, ui.text, true);
+        pTitle = ui.text(titleText, 20, ui.text, true);
         pCard.addView(pTitle);
         pBar = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
         pBar.setMax(1000);
@@ -1221,6 +1231,110 @@ public class MainActivity extends Activity {
         for (int i = 0; i < names.size() && i < max; i++) { if (i > 0) sb.append(", "); sb.append(names.get(i)); }
         if (names.size() > max) sb.append(" and ").append(names.size() - max).append(" more");
         return sb.toString();
+    }
+
+    // ================================================================== delete
+
+    /** Asks before permanently deleting files from the card. */
+    void confirmDelete(final List<Item> todo) {
+        if (todo.isEmpty() || transferring) return;
+        long bytes = 0;
+        int raw = 0, jpg = 0, other = 0;
+        for (Item e : todo) {
+            bytes += e.size;
+            if (e.type == Item.T_RAW) raw++; else if (e.type == Item.T_JPG) jpg++; else other++;
+        }
+        StringBuilder what = new StringBuilder();
+        if (raw > 0) what.append(raw).append(" RAW");
+        if (jpg > 0) what.append(what.length() > 0 ? ", " : "").append(jpg).append(" JPEG");
+        if (other > 0) what.append(what.length() > 0 ? ", " : "").append(other).append(" other");
+        int n = todo.size();
+        String one = n == 1 ? todo.get(0).name : null;
+        AlertDialog d = new AlertDialog.Builder(this)
+                .setTitle(one != null ? "Delete " + one + "?" : "Delete " + n + " files?")
+                .setMessage((one != null ? "" : what + " · ") + Ui.fmtSize(bytes) + "\n\nThis permanently deletes "
+                        + (n == 1 ? "it" : "them") + " from the SD card. It can't be undone.")
+                .setPositiveButton("Delete", (dd, w) -> beginDelete(todo))
+                .setNegativeButton("Cancel", null)
+                .create();
+        d.show();
+        d.getButton(AlertDialog.BUTTON_POSITIVE).setTextColor(ui.danger);
+    }
+
+    private void beginDelete(final List<Item> todo) {
+        if (transferring) return;
+        transferring = true;
+        deleting = true;
+        thumbs.paused = true;
+        cancel.set(false);
+        doneBytes.set(0);
+        curIndex = 0;
+        curName = "";
+        totalFiles = todo.size();
+        totalBytes = 0;
+        for (Item e : todo) totalBytes += e.size;
+        startedAt = SystemClock.elapsedRealtime();
+        showProgressOverlay("Deleting from the card");
+        h.post(progressTick);
+        new Thread(() -> {
+            android.content.ContentResolver cr = getContentResolver();
+            final List<Item> gone = new ArrayList<>();
+            final List<String> failed = new ArrayList<>();
+            boolean cancelled = false;
+            long freed = 0;
+            log("DELETE " + todo.size() + " files from the card");
+            int i = 0;
+            for (Item e : todo) {
+                if (cancel.get()) { cancelled = true; break; }
+                curIndex = ++i;
+                curName = e.name;
+                if (FileOps.delete(cr, e.uri)) { gone.add(e); freed += e.size; log("  deleted " + e.name); }
+                else { failed.add(e.name); log("  could NOT delete " + e.name); }
+                doneBytes.set(freed);
+            }
+            final boolean fc = cancelled;
+            final long ff = freed;
+            log("DONE: " + gone.size() + " deleted, " + failed.size() + " failed" + (fc ? " (cancelled)" : ""));
+            h.post(() -> {
+                transferring = false;
+                deleting = false;
+                thumbs.paused = false;
+                items.removeAll(gone);
+                for (Item e : todo) e.selected = false;
+                applyFilter();
+                refreshPages();
+                showDeleteResult(gone.size(), failed, ff, fc);
+            });
+        }, "delete").start();
+    }
+
+    private void showDeleteResult(int deleted, List<String> failed, long freed, boolean cancelled) {
+        if (overlay == null) return;
+        h.removeCallbacks(progressTick);
+        boolean problems = !failed.isEmpty();
+        if (!problems && !cancelled && deleted <= 3) {  // small deletes: no need for a summary screen
+            closeOverlay();
+            Toast.makeText(this, deleted == 1 ? "Deleted" : "Deleted " + deleted + " files", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        pCard.removeAllViews();
+        pCard.addView(ui.text(problems ? "Finished with problems" : cancelled ? "Stopped" : "Deleted",
+                22, problems ? ui.danger : ui.text, true));
+        StringBuilder sb = new StringBuilder();
+        sb.append(deleted).append(deleted == 1 ? " file" : " files").append(" deleted from the card (")
+                .append(Ui.fmtSize(freed)).append(" freed).");
+        if (problems) sb.append("\n").append(failed.size()).append(" could not be deleted: ").append(join(failed, 4)).append(".");
+        if (cancelled) sb.append("\nYou cancelled before the rest were deleted.");
+        TextView body = ui.text(sb.toString(), 15, ui.textDim, false);
+        body.setPadding(0, ui.px(12), 0, 0);
+        pCard.addView(body);
+        LinearLayout btns = ui.hbox();
+        btns.setGravity(Gravity.END);
+        if (problems) btns.addView(ui.flatButton("Show log", v -> { closeOverlay(); pushPage(new LogPage()); }));
+        btns.addView(ui.primaryButton("Done", v -> closeOverlay()));
+        LinearLayout.LayoutParams bp = Ui.lp(Ui.MATCH, Ui.WRAP);
+        bp.setMargins(0, ui.px(20), 0, 0);
+        pCard.addView(btns, bp);
     }
 
     private void closeOverlay() {
