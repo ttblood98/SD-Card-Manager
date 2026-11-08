@@ -100,6 +100,8 @@ public class MainActivity extends Activity {
     private TextView title, subtitle, closeSel, selAllBtn, sortBtn, settingsBtn, dateChip;
     private final TextView[] typeChips = new TextView[3];
     private DragListView list;
+    private TextView toTop;
+    private boolean toTopShown = false;
     private RowsAdapter adapter;
     private LinearLayout emptyBox, bottomBar;
 
@@ -558,6 +560,26 @@ public class MainActivity extends Activity {
         emptyBox.setGravity(Gravity.CENTER_HORIZONTAL);
         emptyBox.setPadding(ui.px(32), ui.px(32), ui.px(32), ui.px(32));
         content.addView(emptyBox, new FrameLayout.LayoutParams(Ui.MATCH, Ui.WRAP, Gravity.CENTER));
+
+        // small "back to top" button, bottom centre, shown once you have scrolled down a little
+        toTop = ui.text("\u2191", 18, ui.text, true);
+        toTop.setGravity(Gravity.CENTER);
+        toTop.setBackground(ui.round(ui.surface, 18, ui.divider));
+        toTop.setElevation(ui.px(4));
+        toTop.setContentDescription("Back to top");
+        toTop.setAlpha(0f);
+        toTop.setVisibility(View.GONE);
+        toTop.setOnClickListener(v -> scrollToTop());
+        FrameLayout.LayoutParams tp = new FrameLayout.LayoutParams(ui.px(36), ui.px(36), Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL);
+        tp.setMargins(0, 0, 0, ui.px(14));
+        content.addView(toTop, tp);
+        list.setOnScrollListener(new AbsListView.OnScrollListener() {
+            @Override public void onScrollStateChanged(AbsListView v, int state) { }
+
+            @Override public void onScroll(AbsListView v, int first, int visible, int total) {
+                showToTop(first > 1);
+            }
+        });
         root.addView(content, new LinearLayout.LayoutParams(Ui.MATCH, 0, 1f));
 
         bottomBar = ui.hbox();
@@ -582,6 +604,23 @@ public class MainActivity extends Activity {
         bottomBar.addView(moveBtn, bp2);
         root.addView(bottomBar, Ui.lp(Ui.MATCH, Ui.WRAP));
         return root;
+    }
+
+    private void showToTop(boolean show) {
+        if (toTop == null || show == toTopShown) return;
+        toTopShown = show;
+        toTop.animate().cancel();
+        if (show) {
+            toTop.setVisibility(View.VISIBLE);
+            toTop.animate().alpha(1f).setDuration(150).start();
+        } else {
+            toTop.animate().alpha(0f).setDuration(150).withEndAction(() -> { if (!toTopShown) toTop.setVisibility(View.GONE); }).start();
+        }
+    }
+
+    private void scrollToTop() {
+        if (list.getFirstVisiblePosition() > 30) list.setSelection(30);  // long list: jump close, then glide the rest
+        list.smoothScrollToPositionFromTop(0, 0, 250);
     }
 
     private void updateChrome() {
