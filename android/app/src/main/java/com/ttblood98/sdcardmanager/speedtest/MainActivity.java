@@ -5,19 +5,9 @@ import android.app.AlertDialog;
 import android.app.DatePickerDialog;
 import android.content.ClipData;
 import android.content.ClipboardManager;
-import android.content.ContentResolver;
 import android.content.Context;
 import android.content.Intent;
-import android.content.SharedPreferences;
-import android.content.UriPermission;
-import android.database.Cursor;
-import android.graphics.Bitmap;
-import android.graphics.BitmapFactory;
-import android.graphics.Matrix;
-import android.graphics.drawable.ColorDrawable;
-import android.os.ParcelFileDescriptor;
-import android.widget.ImageView;
-import android.graphics.Point;
+import android.content.res.ColorStateList;
 import android.graphics.Typeface;
 import android.net.Uri;
 import android.os.Build;
@@ -25,252 +15,154 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
-import android.provider.DocumentsContract;
 import android.view.Gravity;
+import android.view.HapticFeedbackConstants;
+import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.WindowManager;
-import android.webkit.MimeTypeMap;
+import android.widget.AbsListView;
 import android.widget.BaseAdapter;
-import android.widget.Button;
-import android.widget.CheckBox;
+import android.widget.FrameLayout;
+import android.widget.HorizontalScrollView;
+import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ListView;
+import android.widget.ProgressBar;
 import android.widget.ScrollView;
+import android.widget.Switch;
 import android.widget.TextView;
+import android.widget.Toast;
 
-import java.io.FileInputStream;
-import java.io.IOException;
-import java.nio.ByteBuffer;
-import java.nio.ByteOrder;
-import java.nio.channels.FileChannel;
-import java.io.InputStream;
-import java.io.OutputStream;
 import java.text.SimpleDateFormat;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Calendar;
 import java.util.Collections;
 import java.util.Date;
-import java.util.Deque;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
-import java.util.TreeMap;
-import java.util.zip.CRC32;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * SD card importer, first working version.
- *  - lists the card the way the system Files app does (fast)
- *  - filters by file type and date, multi-select
- *  - Copy, or Move ("cut"): each file is copied, read back and checksummed, and the original is
- *    deleted only after that file verified. Any failure keeps the original.
+ * SD Importer: a gallery of the camera card. Tap to view, long-press (and drag) to select, then Copy or Move to a
+ * destination chosen in the in-app folder picker. Settings hold the one-time setup (card folder, destination folders).
  */
-public class MainActivity extends Activity {
-    private static final int REQ_SRC = 1, REQ_DST = 2;
-    private static final String PREFS = "sdcard_prefs", K_SRC = "src_tree_v2", K_DST = "dst_tree_v2";
-    private static final int T_RAW = 0, T_JPG = 1, T_PNG = 2, T_OTHER = 3;
-    private static final String[] T_NAMES = {"RAW", "JPEG", "PNG", "Other"};
-    private static final Set<String> RAW_EXT = new HashSet<>(java.util.Arrays.asList(
-            "nef", "nrw", "dng", "cr2", "cr3", "crw", "arw", "raf", "orf", "rw2", "pef", "srw", "x3f", "raw"));
+public class MainActivity extends Activity implements Thumbs.Listener {
+    static final int REQ_CARD = 1, REQ_ROOT = 2;
+    static final String[] SORT_NAMES = {"Newest first", "Oldest first", "Name A-Z", "Largest first"};
 
-    private static class Entry {
-        String name;
-        Uri uri;
-        long size;
-        long mtime;
-        int type;
-        boolean selected;
+    /** A full-screen page shown above the gallery (settings, folder picker, viewer, log). */
+    interface Page {
+        View view();
+
+        /** Return true if the page handled Back itself (e.g. went up a folder). */
+        default boolean onBack() { return false; }
+
+        default void refresh() { }
     }
 
-    private static class DestDir {
-        String docId;
-        Uri docUri;
-        final Set<String> names = new HashSet<>();
-    }
-
-    private final Handler ui = new Handler(Looper.getMainLooper());
+    Ui ui;
+    Prefs prefs;
+    Thumbs thumbs;
+    final Handler h = new Handler(Looper.getMainLooper());
+    final ExecutorService bg = Executors.newSingleThreadExecutor();
     private final StringBuilder report = new StringBuilder();
-    private final List<Entry> files = new ArrayList<>();
-    private final List<Entry> shown = new ArrayList<>();
-    private final boolean[] typeOn = {true, true, true, true};
+    private TextView logView;
+
+    final List<Item> items = new ArrayList<>();
+    final List<Item> shown = new ArrayList<>();
+    private final List<Object> rows = new ArrayList<>();
+    private boolean[] types;
+    private int sort;
     private long dateFrom = 0, dateTo = Long.MAX_VALUE;
     private String dateLabel = "All dates";
 
-    private Uri srcTree, dstTree;
-    private volatile boolean busy = false, cancel = false;
+    private Uri card;
+    private volatile boolean scanning = false, transferring = false;
+    private String scanError = null;
+    private boolean scannedOnce = false;
+    private long lastScan = 0;
 
-    private TextView status, selInfo, logView;
-    private ScrollView logScroll;
-    private ListView listView;
-    private Button srcBtn, rescanBtn, dstBtn, dateBtn, selAllBtn, clearBtn, copyBtn, moveBtn, cancelBtn, thumbBtn, reportBtn;
-    private CheckBox dateFolders;
-    private final CheckBox[] typeBoxes = new CheckBox[4];
-    private BaseAdapter adapter;
-    private final SimpleDateFormat fmtDateTime = new SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.US);
+    private FrameLayout host;
+    private final ArrayDeque<Page> pages = new ArrayDeque<>();
+    private FrameLayout overlay;
 
-    // ---------------------------------------------------------------- UI
+    // gallery views
+    private TextView title, subtitle, closeSel, selAllBtn, refreshBtn, settingsBtn, bottomInfo, dateChip, sortChip;
+    private final TextView[] typeChips = new TextView[4];
+    private DragListView list;
+    private RowsAdapter adapter;
+    private LinearLayout emptyBox, bottomBar;
 
-    private Button button(String text, View.OnClickListener l) {
-        Button b = new Button(this);
-        b.setText(text);
-        b.setAllCaps(false);
-        b.setOnClickListener(l);
-        return b;
-    }
-
-    private LinearLayout row() {
-        LinearLayout r = new LinearLayout(this);
-        r.setOrientation(LinearLayout.HORIZONTAL);
-        return r;
-    }
-
-    private LinearLayout.LayoutParams weight() {
-        return new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
-    }
+    // ================================================================== lifecycle
 
     @Override
     protected void onCreate(Bundle b) {
+        ui = new Ui(this);
+        setTheme(ui.night ? android.R.style.Theme_Material_NoActionBar : android.R.style.Theme_Material_Light_NoActionBar);
         super.onCreate(b);
-        float dp = getResources().getDisplayMetrics().density;
-        int pad = (int) (8 * dp);
+        prefs = new Prefs(this);
+        thumbs = new Thumbs(getContentResolver(), h, this::log, this);
+        types = prefs.types();
+        sort = prefs.sort();
 
-        LinearLayout root = new LinearLayout(this);
-        root.setOrientation(LinearLayout.VERTICAL);
-        root.setPadding(pad, pad * 3, pad, pad);
-
-        LinearLayout r1 = row();
-        srcBtn = button("Card folder", v -> pickTree(REQ_SRC));
-        rescanBtn = button("Rescan", v -> startScan());
-        dstBtn = button("Destination", v -> pickTree(REQ_DST));
-        r1.addView(srcBtn, weight());
-        r1.addView(rescanBtn, weight());
-        r1.addView(dstBtn, weight());
-        root.addView(r1);
-
-        status = new TextView(this);
-        status.setTextSize(12);
-        root.addView(status);
-
-        LinearLayout r2 = row();
-        r2.setGravity(Gravity.CENTER_VERTICAL);
-        for (int i = 0; i < 4; i++) {
-            final int t = i;
-            CheckBox cb = new CheckBox(this);
-            cb.setText(T_NAMES[i]);
-            cb.setChecked(true);
-            cb.setOnCheckedChangeListener((v, on) -> { typeOn[t] = on; applyFilter(); });
-            typeBoxes[i] = cb;
-            r2.addView(cb, weight());
+        getWindow().setStatusBarColor(ui.surface);
+        getWindow().setNavigationBarColor(ui.surface);
+        if (!ui.night) {
+            getWindow().getDecorView().setSystemUiVisibility(View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR
+                    | View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR);
         }
-        root.addView(r2);
 
-        LinearLayout r3 = row();
-        dateBtn = button("Date: All dates", v -> chooseDate());
-        selAllBtn = button("Select all", v -> { for (Entry e : shown) e.selected = true; refreshList(); });
-        clearBtn = button("Clear", v -> { for (Entry e : files) e.selected = false; refreshList(); });
-        r3.addView(dateBtn, weight());
-        r3.addView(selAllBtn, weight());
-        r3.addView(clearBtn, weight());
-        root.addView(r3);
+        host = new FrameLayout(this);
+        host.setBackgroundColor(ui.bg);
+        host.addView(buildGallery(), new FrameLayout.LayoutParams(Ui.MATCH, Ui.MATCH));
+        setContentView(host);
 
-        selInfo = new TextView(this);
-        selInfo.setTextSize(13);
-        root.addView(selInfo);
-
-        listView = new ListView(this);
-        adapter = new BaseAdapter() {
-            @Override public int getCount() { return shown.size(); }
-            @Override public Object getItem(int i) { return shown.get(i); }
-            @Override public long getItemId(int i) { return i; }
-            @Override public View getView(int i, View convert, ViewGroup parent) {
-                LinearLayout rowV;
-                CheckBox cb;
-                TextView name, meta;
-                if (convert == null) {
-                    rowV = new LinearLayout(MainActivity.this);
-                    rowV.setOrientation(LinearLayout.HORIZONTAL);
-                    rowV.setGravity(Gravity.CENTER_VERTICAL);
-                    rowV.setPadding(0, (int) (6 * dp), 0, (int) (6 * dp));
-                    cb = new CheckBox(MainActivity.this);
-                    cb.setFocusable(false);
-                    cb.setClickable(false);
-                    LinearLayout col = new LinearLayout(MainActivity.this);
-                    col.setOrientation(LinearLayout.VERTICAL);
-                    name = new TextView(MainActivity.this);
-                    name.setTypeface(Typeface.DEFAULT_BOLD);
-                    meta = new TextView(MainActivity.this);
-                    meta.setTextSize(12);
-                    col.addView(name);
-                    col.addView(meta);
-                    ImageView iv = new ImageView(MainActivity.this);
-                    iv.setScaleType(ImageView.ScaleType.CENTER_CROP);
-                    LinearLayout.LayoutParams ivp = new LinearLayout.LayoutParams((int) (64 * dp), (int) (64 * dp));
-                    ivp.setMargins(0, 0, (int) (8 * dp), 0);
-                    rowV.addView(cb);
-                    rowV.addView(iv, ivp);
-                    rowV.addView(col);
-                    rowV.setTag(new View[]{cb, name, meta, iv});
-                } else {
-                    rowV = (LinearLayout) convert;
-                }
-                View[] v = (View[]) rowV.getTag();
-                Entry e = shown.get(i);
-                ((CheckBox) v[0]).setChecked(e.selected);
-                ((TextView) v[1]).setText(e.name);
-                ((TextView) v[2]).setText(T_NAMES[e.type] + " · " + fmtSize(e.size) + " · " + fmtDateTime.format(new Date(e.mtime)));
-                bindThumb((ImageView) v[3], e);
-                return rowV;
-            }
-        };
-        listView.setAdapter(adapter);
-        listView.setOnItemClickListener((p, v, i, id) -> { shown.get(i).selected = !shown.get(i).selected; refreshList(); });
-        root.addView(listView, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
-
-        dateFolders = new CheckBox(this);
-        dateFolders.setText("Put copies in date folders (YYYY-MM-DD)");
-        root.addView(dateFolders);
-
-        LinearLayout r4 = row();
-        copyBtn = button("Copy", v -> startTransfer(false));
-        moveBtn = button("Move (cut)", v -> startTransfer(true));
-        cancelBtn = button("Cancel", v -> { cancel = true; log("Cancel requested..."); });
-        cancelBtn.setVisibility(View.GONE);
-        r4.addView(copyBtn, weight());
-        r4.addView(moveBtn, weight());
-        r4.addView(cancelBtn, weight());
-        root.addView(r4);
-
-        LinearLayout r5 = row();
-        thumbBtn = button("Thumbnail stats", v -> thumbStats());
-        reportBtn = button("Copy report", v -> copyReport());
-        r5.addView(thumbBtn, weight());
-        r5.addView(reportBtn, weight());
-        root.addView(r5);
-
-        logScroll = new ScrollView(this);
-        logView = new TextView(this);
-        logView.setTypeface(Typeface.MONOSPACE);
-        logView.setTextSize(11);
-        logView.setTextIsSelectable(true);
-        logScroll.addView(logView);
-        root.addView(logScroll, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, (int) (130 * dp)));
-
-        setContentView(root);
-        log("SD importer v" + versionName() + " on " + Build.MANUFACTURER + " " + Build.MODEL + ", Android " + Build.VERSION.RELEASE + " (API " + Build.VERSION.SDK_INT + ")");
-
-        restoreFolders();
-        updateStatus();
-        refreshList();
-        setButtons();
-        if (srcTree != null) startScan();
-        else log("Tap 'Card folder' and choose DCIM on the SD card, then 'Destination' for where to put the photos.");
+        log("SD Importer v" + versionName() + " on " + Build.MANUFACTURER + " " + Build.MODEL + ", Android "
+                + Build.VERSION.RELEASE + " (API " + Build.VERSION.SDK_INT + ")");
+        card = prefs.card();
+        log("Remembered folders: card " + (card != null ? "yes" : "no") + ", destinations " + prefs.roots().size());
+        applyFilter();
+        startScan();
     }
 
-    private String versionName() {
+    @Override
+    protected void onResume() {
+        super.onResume();
+        if (scannedOnce && SystemClock.elapsedRealtime() - lastScan > 3000) startScan();
+    }
+
+    @Override
+    protected void onDestroy() {
+        super.onDestroy();
+        thumbs.shutdown();
+        bg.shutdownNow();
+    }
+
+    @Override
+    public void onBackPressed() {
+        if (overlay != null) {
+            if (transferring) Toast.makeText(this, "Use Cancel to stop the transfer", Toast.LENGTH_SHORT).show();
+            else closeOverlay();
+            return;
+        }
+        if (!pages.isEmpty()) {
+            if (!pages.peek().onBack()) popPage();
+            return;
+        }
+        if (selectedCount() > 0) { clearSelection(); return; }
+        super.onBackPressed();
+    }
+
+    String versionName() {
         try {
             return getPackageManager().getPackageInfo(getPackageName(), 0).versionName;
         } catch (Exception e) {
@@ -278,174 +170,223 @@ public class MainActivity extends Activity {
         }
     }
 
-    private void setButtons() {
-        boolean idle = !busy;
-        srcBtn.setEnabled(idle);
-        rescanBtn.setEnabled(idle && srcTree != null);
-        dstBtn.setEnabled(idle);
-        copyBtn.setEnabled(idle);
-        moveBtn.setEnabled(idle);
-        thumbBtn.setEnabled(!files.isEmpty());
-        cancelBtn.setVisibility(idle ? View.GONE : View.VISIBLE);
-        cancelBtn.setEnabled(!idle);
+    // ================================================================== pages
+
+    void pushPage(Page p) {
+        View v = p.view();
+        v.setClickable(true);  // don't let touches fall through to the gallery
+        host.addView(v, new FrameLayout.LayoutParams(Ui.MATCH, Ui.MATCH));
+        pages.push(p);
+        if (overlay != null) overlay.bringToFront();
     }
 
-    private void updateStatus() {
-        status.setText("Card: " + (srcTree == null ? "(not set)" : treeLabel(srcTree))
-                + "\nDestination: " + (dstTree == null ? "(not set)" : treeLabel(dstTree)));
+    void popPage() {
+        if (pages.isEmpty()) return;
+        Page p = pages.pop();
+        host.removeView(p.view());
+        if (p.view() == logPageView) { logView = null; logPageView = null; }
     }
 
-    private String treeLabel(Uri tree) {
-        String id = DocumentsContract.getTreeDocumentId(tree);
-        return Uri.decode(id);
+    private void refreshPages() {
+        for (Page p : pages) p.refresh();
     }
 
-    // ---------------------------------------------------------------- folders
+    /** A top bar with a Back arrow, used by every page. */
+    LinearLayout pageBar(String titleText, TextView subtitleView, View... actions) {
+        LinearLayout bar = ui.topBar();
+        bar.addView(ui.iconButton("←", "Back", v -> onBackPressed()));
+        bar.addView(ui.titleBlock(ui.text(titleText, 19, ui.text, true), subtitleView));
+        for (View a : actions) bar.addView(a);
+        return bar;
+    }
 
-    private void pickTree(int req) {
-        if (busy) return;
+    // ================================================================== folder access (system picker, one-time setup)
+
+    void pickCard() {
         Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
         i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION
                 | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
-        startActivityForResult(i, req);
+        startActivityForResult(i, REQ_CARD);
+    }
+
+    void pickRoot() {
+        Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
+        i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
+        startActivityForResult(i, REQ_ROOT);
     }
 
     @Override
     protected void onActivityResult(int req, int res, Intent data) {
         super.onActivityResult(req, res, data);
-        if ((req != REQ_SRC && req != REQ_DST) || res != RESULT_OK || data == null || data.getData() == null) return;
+        if ((req != REQ_CARD && req != REQ_ROOT) || res != RESULT_OK || data == null || data.getData() == null) return;
         Uri tree = data.getData();
         try {
             getContentResolver().takePersistableUriPermission(tree,
                     Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
         } catch (Exception e) {
-            log("(could not persist folder permission: " + e + ")");
+            log("Could not keep access to the folder: " + e.getMessage());
         }
-        SharedPreferences.Editor ed = getSharedPreferences(PREFS, MODE_PRIVATE).edit();
-        if (req == REQ_SRC) {
-            srcTree = tree;
-            ed.putString(K_SRC, tree.toString());
-        } else {
-            dstTree = tree;
-            ed.putString(K_DST, tree.toString());
-        }
-        ed.apply();
-        updateStatus();
-        setButtons();
-        log((req == REQ_SRC ? "Card folder: " : "Destination: ") + treeLabel(tree));
-        if (req == REQ_SRC) startScan();
-    }
-
-    private void restoreFolders() {
-        SharedPreferences p = getSharedPreferences(PREFS, MODE_PRIVATE);
-        String s = p.getString(K_SRC, null), d = p.getString(K_DST, null);
-        List<UriPermission> perms = getContentResolver().getPersistedUriPermissions();
-        for (UriPermission up : perms) {
-            if (!up.isReadPermission() || !up.isWritePermission()) continue;
-            if (s != null && up.getUri().toString().equals(s)) srcTree = up.getUri();
-            if (d != null && up.getUri().toString().equals(d)) dstTree = up.getUri();
-        }
-        log("Remembered folders: card " + (srcTree != null ? "yes" : (s != null ? "LOST (permission gone)" : "none"))
-                + ", destination " + (dstTree != null ? "yes" : (d != null ? "LOST (permission gone)" : "none")));
-    }
-
-    // ---------------------------------------------------------------- scanning
-
-    private void startScan() {
-        if (busy || srcTree == null) return;
-        startWork(this::scan);
-    }
-
-    private static int typeOf(String name) {
-        int i = name.lastIndexOf('.');
-        String x = i > 0 ? name.substring(i + 1).toLowerCase(Locale.ROOT) : "";
-        if (RAW_EXT.contains(x)) return T_RAW;
-        if (x.equals("jpg") || x.equals("jpeg")) return T_JPG;
-        if (x.equals("png")) return T_PNG;
-        return T_OTHER;
-    }
-
-    private void scan() {
-        final List<Entry> found = new ArrayList<>();
-        ContentResolver cr = getContentResolver();
-        String[] proj = {
-                DocumentsContract.Document.COLUMN_DOCUMENT_ID,
-                DocumentsContract.Document.COLUMN_DISPLAY_NAME,
-                DocumentsContract.Document.COLUMN_MIME_TYPE,
-                DocumentsContract.Document.COLUMN_SIZE,
-                DocumentsContract.Document.COLUMN_LAST_MODIFIED,
-        };
-        Deque<String> stack = new ArrayDeque<>();
-        stack.push(DocumentsContract.getTreeDocumentId(srcTree));
-        int dirs = 0;
-        long t0 = SystemClock.elapsedRealtime();
-        try {
-            while (!stack.isEmpty()) {
-                String dirId = stack.pop();
-                dirs++;
-                Uri children = DocumentsContract.buildChildDocumentsUriUsingTree(srcTree, dirId);
-                try (Cursor c = cr.query(children, proj, null, null, null)) {
-                    if (c == null) continue;
-                    while (c.moveToNext()) {
-                        String name = c.getString(1);
-                        if (name == null || name.startsWith(".")) continue;
-                        if (DocumentsContract.Document.MIME_TYPE_DIR.equals(c.getString(2))) {
-                            stack.push(c.getString(0));
-                        } else {
-                            Entry e = new Entry();
-                            e.name = name;
-                            e.uri = DocumentsContract.buildDocumentUriUsingTree(srcTree, c.getString(0));
-                            e.size = c.isNull(3) ? 0 : c.getLong(3);
-                            e.mtime = c.isNull(4) ? 0 : c.getLong(4);
-                            e.type = typeOf(name);
-                            found.add(e);
-                        }
-                    }
-                }
-            }
-        } catch (Exception ex) {
-            log("Could not read the card folder: " + ex + "\n   Is the card plugged in? Tap 'Card folder' to pick it again.");
-            return;
-        }
-        long ms = SystemClock.elapsedRealtime() - t0;
-        long bytes = 0;
-        for (Entry e : found) bytes += e.size;
-        log("Scanned " + found.size() + " files (" + fmtSize(bytes) + ") in " + dirs + " folders in " + ms + " ms");
-        final int n = found.size();
-        ui.post(() -> {
-            thumbMissing.clear();
-            files.clear();
-            files.addAll(found);
+        if (req == REQ_CARD) {
+            prefs.setCard(tree);
+            card = tree;
+            log("Card folder: " + Prefs.rootLabel(tree));
+            items.clear();
             applyFilter();
-            setButtons();
+            startScan();
+        } else {
+            prefs.addRoot(tree);
+            log("Destination folder added: " + Prefs.rootLabel(tree));
+        }
+        refreshPages();
+    }
+
+    // ================================================================== scanning
+
+    void startScan() {
+        card = prefs.card();
+        if (card == null) { updateChrome(); return; }
+        if (scanning || transferring) return;
+        scanning = true;
+        scanError = null;
+        updateChrome();
+        final Uri tree = card;
+        bg.execute(() -> {
+            long t0 = SystemClock.elapsedRealtime();
+            List<Item> found = null;
+            String err = null;
+            try {
+                found = FileOps.scan(getContentResolver(), tree);
+            } catch (Exception e) {
+                err = e.getMessage() != null ? e.getMessage() : e.toString();
+            }
+            final long ms = SystemClock.elapsedRealtime() - t0;
+            final List<Item> f = found;
+            final String fe = err;
+            h.post(() -> {
+                scanning = false;
+                scannedOnce = true;
+                lastScan = SystemClock.elapsedRealtime();
+                if (fe != null) {
+                    scanError = fe;
+                    items.clear();
+                    log("Could not read the card: " + fe);
+                } else {
+                    Set<String> sel = new HashSet<>();
+                    for (Item i : items) if (i.selected) sel.add(i.key());
+                    items.clear();
+                    items.addAll(f);
+                    for (Item i : items) i.selected = sel.contains(i.key());
+                    thumbs.forgetFailures();
+                    long bytes = 0;
+                    for (Item i : items) bytes += i.size;
+                    log("Scanned " + items.size() + " files (" + Ui.fmtSize(bytes) + ") in " + ms + " ms");
+                }
+                applyFilter();
+                refreshPages();
+            });
         });
     }
 
-    // ---------------------------------------------------------------- filtering / selection
+    // ================================================================== filtering, sorting, grouping
 
-    private void applyFilter() {
+    void applyFilter() {
         shown.clear();
-        for (Entry e : files) {
-            boolean ok = typeOn[e.type] && e.mtime >= dateFrom && e.mtime <= dateTo;
+        for (Item e : items) {
+            boolean ok = types[e.type] && e.mtime >= dateFrom && e.mtime <= dateTo;
             if (ok) shown.add(e);
             else e.selected = false;
         }
-        Collections.sort(shown, (a, b) -> a.mtime != b.mtime ? Long.compare(b.mtime, a.mtime) : b.name.compareTo(a.name));
-        refreshList();
+        switch (sort) {
+            case 1: Collections.sort(shown, (a, b) -> a.mtime != b.mtime ? Long.compare(a.mtime, b.mtime) : a.name.compareTo(b.name)); break;
+            case 2: Collections.sort(shown, (a, b) -> a.name.compareToIgnoreCase(b.name)); break;
+            case 3: Collections.sort(shown, (a, b) -> Long.compare(b.size, a.size)); break;
+            default: Collections.sort(shown, (a, b) -> a.mtime != b.mtime ? Long.compare(b.mtime, a.mtime) : b.name.compareTo(a.name));
+        }
+        rebuildRows();
+        if (adapter != null) adapter.notifyDataSetChanged();
+        updateChrome();
     }
 
-    private void refreshList() {
-        long bytes = 0;
-        int sel = 0;
-        for (Entry e : shown) if (e.selected) { sel++; bytes += e.size; }
-        selInfo.setText(sel + " selected (" + fmtSize(bytes) + ") · showing " + shown.size() + " of " + files.size() + " files · " + dateLabel);
-        dateBtn.setText("Date: " + dateLabel);
-        adapter.notifyDataSetChanged();
+    private static final class Header {
+        String label;
+        int start, end;
+    }
+
+    private static final class TileRow {
+        int start, count;
+    }
+
+    private void rebuildRows() {
+        rows.clear();
+        int cols = prefs.columns();
+        boolean group = sort == 0 || sort == 1;
+        int i = 0;
+        while (i < shown.size()) {
+            int end = shown.size();
+            if (group) {
+                int day = dayKey(shown.get(i).mtime);
+                end = i;
+                while (end < shown.size() && dayKey(shown.get(end).mtime) == day) end++;
+                Header hd = new Header();
+                hd.label = dayLabel(shown.get(i).mtime);
+                hd.start = i;
+                hd.end = end;
+                rows.add(hd);
+            }
+            for (int s = i; s < end; s += cols) {
+                TileRow tr = new TileRow();
+                tr.start = s;
+                tr.count = Math.min(cols, end - s);
+                rows.add(tr);
+            }
+            i = end;
+        }
+    }
+
+    private static int dayKey(long ms) {
+        Calendar c = Calendar.getInstance();
+        c.setTimeInMillis(ms);
+        return c.get(Calendar.YEAR) * 1000 + c.get(Calendar.DAY_OF_YEAR);
+    }
+
+    private static String dayLabel(long ms) {
+        int k = dayKey(ms);
+        Calendar now = Calendar.getInstance();
+        if (k == dayKey(now.getTimeInMillis())) return "Today";
+        now.add(Calendar.DAY_OF_YEAR, -1);
+        if (k == dayKey(now.getTimeInMillis())) return "Yesterday";
+        return new SimpleDateFormat("EEE, MMM d, yyyy", Locale.getDefault()).format(new Date(ms));
+    }
+
+    private void toggleType(int t) {
+        types[t] = !types[t];
+        prefs.setTypes(types);
+        applyFilter();
+    }
+
+    private void resetFilters() {
+        for (int i = 0; i < 4; i++) types[i] = true;
+        prefs.setTypes(types);
+        dateFrom = 0;
+        dateTo = Long.MAX_VALUE;
+        dateLabel = "All dates";
+        applyFilter();
+    }
+
+    private void chooseSort() {
+        new AlertDialog.Builder(this).setTitle("Sort by")
+                .setSingleChoiceItems(SORT_NAMES, sort, (d, which) -> {
+                    sort = which;
+                    prefs.setSort(which);
+                    applyFilter();
+                    d.dismiss();
+                }).show();
     }
 
     private void chooseDate() {
-        final String[] opts = {"All dates", "Today", "Last 3 days", "Last 7 days", "Last 30 days", "Custom range..."};
-        new AlertDialog.Builder(this).setTitle("Date (file modified date)").setItems(opts, (d, which) -> {
+        final String[] opts = {"All dates", "Today", "Last 3 days", "Last 7 days", "Last 30 days", "Pick a date range..."};
+        new AlertDialog.Builder(this).setTitle("Show photos from").setItems(opts, (d, which) -> {
             Calendar c = Calendar.getInstance();
             startOfDay(c);
             switch (which) {
@@ -468,21 +409,24 @@ public class MainActivity extends Activity {
 
     private void pickCustomRange() {
         final Calendar now = Calendar.getInstance();
-        new DatePickerDialog(this, (v1, y1, m1, d1) -> {
+        DatePickerDialog first = new DatePickerDialog(this, (v1, y1, m1, d1) -> {
             final Calendar from = Calendar.getInstance();
             from.set(y1, m1, d1);
             startOfDay(from);
-            new DatePickerDialog(this, (v2, y2, m2, d2) -> {
+            DatePickerDialog second = new DatePickerDialog(this, (v2, y2, m2, d2) -> {
                 Calendar to = Calendar.getInstance();
                 to.set(y2, m2, d2);
                 startOfDay(to);
                 to.add(Calendar.DAY_OF_YEAR, 1);
                 to.add(Calendar.MILLISECOND, -1);
-                SimpleDateFormat f = new SimpleDateFormat("yyyy-MM-dd", Locale.US);
-                setRange(from.getTimeInMillis(), to.getTimeInMillis(),
-                        f.format(from.getTime()) + " to " + f.format(to.getTime()));
-            }, y1, m1, d1).show();
-        }, now.get(Calendar.YEAR), now.get(Calendar.MONTH), now.get(Calendar.DAY_OF_MONTH)).show();
+                SimpleDateFormat f = new SimpleDateFormat("MMM d", Locale.getDefault());
+                setRange(from.getTimeInMillis(), to.getTimeInMillis(), f.format(from.getTime()) + " - " + f.format(to.getTime()));
+            }, y1, m1, d1);
+            second.setTitle("To");
+            second.show();
+        }, now.get(Calendar.YEAR), now.get(Calendar.MONTH), now.get(Calendar.DAY_OF_MONTH));
+        first.setTitle("From");
+        first.show();
     }
 
     private void setRange(long from, long to, String label) {
@@ -492,588 +436,867 @@ public class MainActivity extends Activity {
         applyFilter();
     }
 
-    // ---------------------------------------------------------------- threading helpers
+    // ================================================================== selection
 
-    private void startWork(final Runnable r) {
-        if (busy) return;
-        busy = true;
-        cancel = false;
-        setButtons();
-        getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-        new Thread(() -> {
-            try {
-                r.run();
-            } catch (Throwable t) {
-                log("FAILED: " + t);
-            }
-            busy = false;
-            ui.post(() -> {
-                getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-                setButtons();
-                refreshList();
-            });
-        }).start();
+    int selectedCount() {
+        int n = 0;
+        for (Item e : shown) if (e.selected) n++;
+        return n;
     }
 
-    // ---------------------------------------------------------------- copy / move
+    List<Item> selectedItems() {
+        List<Item> out = new ArrayList<>();
+        for (Item e : shown) if (e.selected) out.add(e);
+        return out;
+    }
 
-    private void startTransfer(final boolean move) {
-        if (busy) return;
-        if (srcTree == null) { log("Pick the card folder first."); return; }
-        if (dstTree == null) { log("Pick a destination folder first."); return; }
-        final List<Entry> todo = new ArrayList<>();
+    void onSelectionChanged() {
+        if (adapter != null) adapter.notifyDataSetChanged();
+        updateChrome();
+    }
+
+    void clearSelection() {
+        for (Item e : items) e.selected = false;
+        onSelectionChanged();
+    }
+
+    private void selectAllShown() {
+        boolean all = selectedCount() == shown.size();
+        for (Item e : shown) e.selected = !all;
+        onSelectionChanged();
+    }
+
+    private void toggleRange(int start, int end) {
+        boolean all = true;
+        for (int i = start; i < end; i++) if (!shown.get(i).selected) { all = false; break; }
+        for (int i = start; i < end; i++) shown.get(i).selected = !all;
+        onSelectionChanged();
+    }
+
+    private void onTileTap(int idx) {
+        if (idx < 0 || idx >= shown.size()) return;
+        if (selectedCount() > 0) {
+            shown.get(idx).selected = !shown.get(idx).selected;
+            onSelectionChanged();
+        } else {
+            pushPage(new Viewer(this, idx));
+        }
+    }
+
+    @Override
+    public void onThumbsChanged() {
+        if (adapter != null) adapter.notifyDataSetChanged();
+    }
+
+    // ================================================================== gallery UI
+
+    private View buildGallery() {
+        LinearLayout root = ui.vbox();
+        root.setBackgroundColor(ui.bg);
+
+        LinearLayout bar = ui.topBar();
+        closeSel = ui.iconButton("✕", "Clear selection", v -> clearSelection());
+        title = ui.text("SD Importer", 20, ui.text, true);
+        subtitle = ui.text("", 13, ui.textDim, false);
+        selAllBtn = ui.flatButton("Select all", v -> selectAllShown());
+        refreshBtn = ui.iconButton("⟳", "Rescan card", v -> startScan());
+        settingsBtn = ui.iconButton("⚙", "Settings", v -> pushPage(new SettingsPage()));
+        bar.addView(closeSel);
+        LinearLayout tb = ui.titleBlock(title, subtitle);
+        tb.setPadding(ui.px(12), 0, ui.px(8), 0);
+        bar.addView(tb);
+        bar.addView(selAllBtn);
+        bar.addView(refreshBtn);
+        bar.addView(settingsBtn);
+        root.addView(bar, Ui.lp(Ui.MATCH, Ui.WRAP));
+
+        HorizontalScrollView hs = new HorizontalScrollView(this);
+        hs.setHorizontalScrollBarEnabled(false);
+        hs.setBackgroundColor(ui.bg);
+        LinearLayout chips = ui.hbox();
+        chips.setPadding(ui.px(12), ui.px(10), ui.px(12), ui.px(6));
+        for (int i = 0; i < 4; i++) {
+            final int t = i;
+            typeChips[i] = ui.chip(Item.TYPE_NAMES[i], v -> toggleType(t));
+            chips.addView(typeChips[i]);
+        }
+        View sep = new View(this);
+        sep.setBackgroundColor(ui.divider);
+        LinearLayout.LayoutParams sp = new LinearLayout.LayoutParams(ui.px(1), ui.px(24));
+        sp.setMargins(ui.px(2), 0, ui.px(10), 0);
+        chips.addView(sep, sp);
+        dateChip = ui.chip("All dates", v -> chooseDate());
+        sortChip = ui.chip(SORT_NAMES[0], v -> chooseSort());
+        chips.addView(dateChip);
+        chips.addView(sortChip);
+        hs.addView(chips);
+        root.addView(hs, Ui.lp(Ui.MATCH, Ui.WRAP));
+
+        FrameLayout content = new FrameLayout(this);
+        list = new DragListView(this);
+        list.setDivider(null);
+        list.setDividerHeight(0);
+        list.setSelector(new android.graphics.drawable.ColorDrawable(0));
+        list.setCacheColorHint(0);
+        list.setClipToPadding(false);
+        list.setPadding(0, 0, 0, ui.px(12));
+        adapter = new RowsAdapter();
+        list.setAdapter(adapter);
+        content.addView(list, new FrameLayout.LayoutParams(Ui.MATCH, Ui.MATCH));
+        emptyBox = ui.vbox();
+        emptyBox.setGravity(Gravity.CENTER_HORIZONTAL);
+        emptyBox.setPadding(ui.px(32), ui.px(32), ui.px(32), ui.px(32));
+        content.addView(emptyBox, new FrameLayout.LayoutParams(Ui.MATCH, Ui.WRAP, Gravity.CENTER));
+        root.addView(content, new LinearLayout.LayoutParams(Ui.MATCH, 0, 1f));
+
+        bottomBar = ui.hbox();
+        bottomBar.setBackgroundColor(ui.surface);
+        bottomBar.setElevation(ui.px(8));
+        bottomBar.setPadding(ui.px(16), ui.px(10), ui.px(12), ui.px(10));
+        bottomInfo = ui.text("", 14, ui.textDim, false);
+        bottomBar.addView(bottomInfo, Ui.weight(1));
+        TextView copyBtn = ui.secondaryButton("Copy", v -> startTransferFlow(false));
+        TextView moveBtn = ui.primaryButton("Move", v -> startTransferFlow(true));
+        LinearLayout.LayoutParams bp = Ui.lp(Ui.WRAP, Ui.WRAP);
+        bp.setMargins(ui.px(8), 0, 0, 0);
+        bottomBar.addView(copyBtn, bp);
+        LinearLayout.LayoutParams bp2 = Ui.lp(Ui.WRAP, Ui.WRAP);
+        bp2.setMargins(ui.px(8), 0, 0, 0);
+        bottomBar.addView(moveBtn, bp2);
+        root.addView(bottomBar, Ui.lp(Ui.MATCH, Ui.WRAP));
+        return root;
+    }
+
+    private void updateChrome() {
+        if (title == null) return;
+        int n = 0;
+        long selBytes = 0, shownBytes = 0;
+        for (Item e : shown) { shownBytes += e.size; if (e.selected) { n++; selBytes += e.size; } }
+        boolean sel = n > 0;
+        closeSel.setVisibility(sel ? View.VISIBLE : View.GONE);
+        selAllBtn.setVisibility(sel ? View.VISIBLE : View.GONE);
+        selAllBtn.setText(n == shown.size() ? "Select none" : "Select all");
+        refreshBtn.setVisibility(sel ? View.GONE : View.VISIBLE);
+        settingsBtn.setVisibility(sel ? View.GONE : View.VISIBLE);
+        bottomBar.setVisibility(sel ? View.VISIBLE : View.GONE);
+        if (sel) {
+            title.setText(n + " selected");
+            subtitle.setText(Ui.fmtSize(selBytes));
+            bottomInfo.setText(n + " file" + (n == 1 ? "" : "s") + " · " + Ui.fmtSize(selBytes));
+        } else {
+            title.setText("SD Importer");
+            if (scanning && items.isEmpty()) subtitle.setText("Reading card…");
+            else if (card == null) subtitle.setText("No card folder yet");
+            else if (shown.size() == items.size()) subtitle.setText(items.size() + " files · " + Ui.fmtSize(shownBytes));
+            else subtitle.setText(shown.size() + " of " + items.size() + " files · " + Ui.fmtSize(shownBytes));
+        }
+        for (int i = 0; i < 4; i++) ui.setChip(typeChips[i], types[i]);
+        dateChip.setText(dateLabel);
+        ui.setChip(dateChip, dateFrom != 0 || dateTo != Long.MAX_VALUE);
+        sortChip.setText(SORT_NAMES[sort]);
+        ui.setChip(sortChip, false);
+        updateEmpty();
+    }
+
+    private void updateEmpty() {
+        emptyBox.removeAllViews();
+        String head = null, body = null;
+        List<View> buttons = new ArrayList<>();
+        if (card == null) {
+            head = prefs.cardWasSet() ? "Card folder access was lost" : "Welcome to SD Importer";
+            body = "Choose the DCIM folder on your camera's SD card. You only need to do this once; it is remembered.";
+            buttons.add(ui.primaryButton("Choose card folder", v -> pickCard()));
+        } else if (scanError != null) {
+            head = "Can't read the card";
+            body = "Is the SD card plugged in? (" + scanError + ")";
+            buttons.add(ui.primaryButton("Try again", v -> startScan()));
+            buttons.add(ui.secondaryButton("Choose a different folder", v -> pickCard()));
+        } else if (scanning && items.isEmpty()) {
+            head = "Reading card…";
+        } else if (items.isEmpty() && scannedOnce) {
+            head = "No files here";
+            body = "The card folder is empty. Did you pick the right folder?";
+            buttons.add(ui.secondaryButton("Choose a different folder", v -> pickCard()));
+        } else if (shown.isEmpty() && !items.isEmpty()) {
+            head = "Nothing matches these filters";
+            buttons.add(ui.secondaryButton("Reset filters", v -> resetFilters()));
+        }
+        if (head == null) { emptyBox.setVisibility(View.GONE); return; }
+        emptyBox.setVisibility(View.VISIBLE);
+        TextView h1 = ui.text(head, 20, ui.text, true);
+        h1.setGravity(Gravity.CENTER);
+        emptyBox.addView(h1, Ui.lp(Ui.MATCH, Ui.WRAP));
+        if (body != null) {
+            TextView b1 = ui.text(body, 15, ui.textDim, false);
+            b1.setGravity(Gravity.CENTER);
+            b1.setPadding(0, ui.px(8), 0, ui.px(8));
+            emptyBox.addView(b1, Ui.lp(Ui.MATCH, Ui.WRAP));
+        }
+        for (View bt : buttons) {
+            LinearLayout.LayoutParams p = Ui.lp(Ui.MATCH, Ui.WRAP);
+            p.setMargins(0, ui.px(12), 0, 0);
+            emptyBox.addView(bt, p);
+        }
+    }
+
+    // ---- grid rows
+
+    private final class RowHolder {
+        int cols;
+        FrameLayout[] frames;
+        ImageView[] imgs;
+        TextView[] badges, checks, labels;
+        int[] index;
+    }
+
+    private final class HeaderHolder {
+        TextView label, count, check;
+        Header header;
+    }
+
+    private final class RowsAdapter extends BaseAdapter {
+        @Override public int getCount() { return rows.size(); }
+        @Override public Object getItem(int i) { return rows.get(i); }
+        @Override public long getItemId(int i) { return i; }
+        @Override public int getViewTypeCount() { return 2; }
+        @Override public int getItemViewType(int i) { return rows.get(i) instanceof Header ? 0 : 1; }
+        @Override public boolean areAllItemsEnabled() { return false; }
+        @Override public boolean isEnabled(int i) { return false; }
+
+        @Override
+        public View getView(int pos, View convert, ViewGroup parent) {
+            Object r = rows.get(pos);
+            boolean selMode = selectedCount() > 0;
+            if (r instanceof Header) {
+                Header hd = (Header) r;
+                HeaderHolder hh;
+                if (convert == null) {
+                    LinearLayout row = ui.hbox();
+                    row.setPadding(ui.px(16), ui.px(14), ui.px(8), ui.px(6));
+                    hh = new HeaderHolder();
+                    hh.label = ui.text("", 15, ui.text, true);
+                    hh.count = ui.text("", 13, ui.textDim, false);
+                    hh.check = ui.text("", 14, ui.accent, true);
+                    hh.check.setGravity(Gravity.CENTER);
+                    hh.check.setPadding(ui.px(12), ui.px(6), ui.px(12), ui.px(6));
+                    hh.check.setBackground(ui.ripple(null, ui.rippleColor()));
+                    final HeaderHolder fh = hh;
+                    hh.check.setOnClickListener(v -> toggleRange(fh.header.start, fh.header.end));
+                    row.addView(hh.label);
+                    LinearLayout.LayoutParams cp = Ui.lp(Ui.WRAP, Ui.WRAP);
+                    cp.setMargins(ui.px(8), 0, 0, 0);
+                    row.addView(hh.count, cp);
+                    row.addView(ui.spacer());
+                    row.addView(hh.check);
+                    row.setTag(hh);
+                    convert = row;
+                } else {
+                    hh = (HeaderHolder) convert.getTag();
+                }
+                hh.header = hd;
+                hh.label.setText(hd.label);
+                int n = hd.end - hd.start;
+                hh.count.setText(String.valueOf(n));
+                boolean all = true;
+                for (int i = hd.start; i < hd.end; i++) if (!shown.get(i).selected) { all = false; break; }
+                hh.check.setText(all ? "Deselect" : "Select");
+                return convert;
+            }
+
+            TileRow tr = (TileRow) r;
+            int cols = prefs.columns();
+            int w = list.getWidth() > 0 ? list.getWidth() : getResources().getDisplayMetrics().widthPixels;
+            int tile = w / cols;
+            RowHolder rh = convert != null ? (RowHolder) convert.getTag() : null;
+            if (rh == null || rh.cols != cols) {
+                LinearLayout row = ui.hbox();
+                rh = new RowHolder();
+                rh.cols = cols;
+                rh.frames = new FrameLayout[cols];
+                rh.imgs = new ImageView[cols];
+                rh.badges = new TextView[cols];
+                rh.checks = new TextView[cols];
+                rh.labels = new TextView[cols];
+                rh.index = new int[cols];
+                for (int c = 0; c < cols; c++) buildTile(row, rh, c);
+                row.setTag(rh);
+                row.setLayoutParams(new AbsListView.LayoutParams(Ui.MATCH, tile));
+                convert = row;
+            }
+            ViewGroup.LayoutParams lp = convert.getLayoutParams();
+            if (lp == null || lp.height != tile) convert.setLayoutParams(new AbsListView.LayoutParams(Ui.MATCH, tile));
+            for (int c = 0; c < cols; c++) {
+                if (c >= tr.count) { rh.frames[c].setVisibility(View.INVISIBLE); rh.index[c] = -1; continue; }
+                int idx = tr.start + c;
+                rh.index[c] = idx;
+                Item e = shown.get(idx);
+                rh.frames[c].setVisibility(View.VISIBLE);
+                rh.frames[c].setContentDescription(e.name + (e.selected ? ", selected" : ""));
+                thumbs.bind(rh.imgs[c], e);
+                float scale = e.selected ? 0.84f : 1f;
+                rh.imgs[c].setScaleX(scale);
+                rh.imgs[c].setScaleY(scale);
+                rh.frames[c].setBackgroundColor(e.selected ? ui.selected : 0);
+                String badge = e.type == Item.T_RAW ? (e.ext().isEmpty() ? "RAW" : e.ext()) : e.type == Item.T_JPG ? "JPG" : e.ext();
+                rh.badges[c].setText(badge);
+                rh.badges[c].setVisibility(badge.isEmpty() ? View.GONE : View.VISIBLE);
+                rh.labels[c].setVisibility(e.type == Item.T_OTHER ? View.VISIBLE : View.GONE);
+                rh.labels[c].setText(e.ext().isEmpty() ? "FILE" : e.ext());
+                TextView ck = rh.checks[c];
+                if (!selMode) {
+                    ck.setVisibility(View.GONE);
+                } else {
+                    ck.setVisibility(View.VISIBLE);
+                    if (e.selected) {
+                        ck.setText("✓");
+                        ck.setBackground(oval(ui.accent, 0));
+                    } else {
+                        ck.setText("");
+                        ck.setBackground(oval(0x33000000, 0xFFFFFFFF));
+                    }
+                }
+            }
+            return convert;
+        }
+    }
+
+    private android.graphics.drawable.GradientDrawable oval(int fill, int stroke) {
+        android.graphics.drawable.GradientDrawable g = new android.graphics.drawable.GradientDrawable();
+        g.setShape(android.graphics.drawable.GradientDrawable.OVAL);
+        g.setColor(fill);
+        if (stroke != 0) g.setStroke(ui.px(2), stroke);
+        return g;
+    }
+
+    private void buildTile(LinearLayout row, RowHolder rh, int c) {
+        FrameLayout f = new FrameLayout(this);
+        int m = Math.max(1, ui.px(1));
+        LinearLayout.LayoutParams fp = new LinearLayout.LayoutParams(0, Ui.MATCH, 1f);
+        fp.setMargins(m, m, m, m);
+        row.addView(f, fp);
+
+        ImageView iv = new ImageView(this);
+        iv.setScaleType(ImageView.ScaleType.CENTER_CROP);
+        iv.setBackgroundColor(ui.surface2);
+        f.addView(iv, new FrameLayout.LayoutParams(Ui.MATCH, Ui.MATCH));
+
+        TextView label = ui.text("", 15, ui.textDim, true);
+        label.setGravity(Gravity.CENTER);
+        f.addView(label, new FrameLayout.LayoutParams(Ui.MATCH, Ui.MATCH));
+
+        TextView badge = ui.text("", 10, 0xFFFFFFFF, true);
+        badge.setBackground(ui.round(0x99000000, 4, 0));
+        badge.setPadding(ui.px(4), ui.px(1), ui.px(4), ui.px(1));
+        FrameLayout.LayoutParams blp = new FrameLayout.LayoutParams(Ui.WRAP, Ui.WRAP, Gravity.BOTTOM | Gravity.START);
+        blp.setMargins(ui.px(4), 0, 0, ui.px(4));
+        f.addView(badge, blp);
+
+        TextView check = ui.text("", 13, ui.onAccent, true);
+        check.setGravity(Gravity.CENTER);
+        FrameLayout.LayoutParams clp = new FrameLayout.LayoutParams(ui.px(24), ui.px(24), Gravity.TOP | Gravity.END);
+        clp.setMargins(0, ui.px(6), ui.px(6), 0);
+        f.addView(check, clp);
+
+        f.setForeground(ui.ripple(null, 0x33FFFFFF));
+        final RowHolder h2 = rh;
+        final int col = c;
+        f.setOnClickListener(v -> onTileTap(h2.index[col]));
+        f.setOnLongClickListener(v -> {
+            int idx = h2.index[col];
+            if (idx >= 0) list.startDrag(idx);
+            return true;
+        });
+        rh.frames[c] = f;
+        rh.imgs[c] = iv;
+        rh.labels[c] = label;
+        rh.badges[c] = badge;
+        rh.checks[c] = check;
+    }
+
+    // ---- long-press + drag selection (like a phone gallery), with auto-scroll at the edges
+
+    private final class DragListView extends ListView {
+        private boolean dragging, autoScrolling;
+        private int anchor, lastIdx, lo, hi;
+        private boolean target;
+        private boolean[] snap;
+        private float lastX, lastY;
+        private final Runnable tick = this::autoScrollTick;
+
+        DragListView(Context c) { super(c); }
+
+        void startDrag(int idx) {
+            if (idx < 0 || idx >= shown.size()) return;
+            dragging = true;
+            anchor = idx;
+            lastIdx = -1;
+            target = !shown.get(idx).selected;
+            snap = new boolean[shown.size()];
+            for (int i = 0; i < snap.length; i++) snap[i] = shown.get(i).selected;
+            lo = hi = idx;
+            performHapticFeedback(HapticFeedbackConstants.LONG_PRESS);
+            long now = SystemClock.uptimeMillis();
+            MotionEvent cancel = MotionEvent.obtain(now, now, MotionEvent.ACTION_CANCEL, 0, 0, 0);
+            super.dispatchTouchEvent(cancel);
+            cancel.recycle();
+            if (getParent() != null) getParent().requestDisallowInterceptTouchEvent(true);
+            applyRange(idx);
+        }
+
+        @Override
+        public boolean dispatchTouchEvent(MotionEvent ev) {
+            if (!dragging) return super.dispatchTouchEvent(ev);
+            int a = ev.getActionMasked();
+            lastX = ev.getX();
+            lastY = ev.getY();
+            if (a == MotionEvent.ACTION_MOVE) {
+                updateFromPoint();
+                if (!autoScrolling && edgeSpeed() != 0) { autoScrolling = true; postOnAnimation(tick); }
+            } else if (a == MotionEvent.ACTION_UP || a == MotionEvent.ACTION_CANCEL) {
+                dragging = false;
+                autoScrolling = false;
+                removeCallbacks(tick);
+            }
+            return true;
+        }
+
+        private int edgeSpeed() {
+            float edge = ui.px(72), max = ui.px(22);
+            if (lastY < edge) return -(int) Math.max(2, (edge - lastY) / edge * max);
+            if (lastY > getHeight() - edge) return (int) Math.max(2, (lastY - (getHeight() - edge)) / edge * max);
+            return 0;
+        }
+
+        private void autoScrollTick() {
+            if (!dragging) { autoScrolling = false; return; }
+            int dy = edgeSpeed();
+            if (dy == 0) { autoScrolling = false; return; }
+            scrollListBy(dy);
+            updateFromPoint();
+            postOnAnimation(tick);
+        }
+
+        private void updateFromPoint() {
+            int idx = indexAt(lastX, lastY);
+            if (idx >= 0 && idx != lastIdx) applyRange(idx);
+        }
+
+        private int indexAt(float x, float y) {
+            int cols = prefs.columns();
+            for (int c = 0; c < getChildCount(); c++) {
+                View ch = getChildAt(c);
+                if (y < ch.getTop() || y >= ch.getBottom()) continue;
+                int pos = getFirstVisiblePosition() + c;
+                if (pos < 0 || pos >= rows.size()) return -1;
+                Object r = rows.get(pos);
+                if (!(r instanceof TileRow)) return -1;
+                TileRow tr = (TileRow) r;
+                int col = (int) (x / (getWidth() / (float) cols));
+                col = Math.max(0, Math.min(col, tr.count - 1));
+                return tr.start + col;
+            }
+            return -1;
+        }
+
+        private void applyRange(int idx) {
+            int nlo = Math.min(anchor, idx), nhi = Math.max(anchor, idx);
+            int from = Math.min(lo, nlo), to = Math.max(hi, nhi);
+            for (int i = from; i <= to && i < shown.size(); i++) {
+                shown.get(i).selected = (i >= nlo && i <= nhi) ? target : (i < snap.length && snap[i]);
+            }
+            lo = nlo;
+            hi = nhi;
+            lastIdx = idx;
+            onSelectionChanged();
+        }
+    }
+
+    // ================================================================== copy / move
+
+    private void startTransferFlow(boolean move) {
+        List<Item> sel = selectedItems();
+        if (sel.isEmpty() || transferring) return;
+        pushPage(new DestPicker(this, sel, move));
+    }
+
+    /** Called by the folder picker once a destination is chosen. */
+    void confirmTransfer(final List<Item> todo, final boolean move, final Prefs.Dest dest) {
         long bytes = 0;
-        for (Entry e : shown) if (e.selected) { todo.add(e); bytes += e.size; }
-        if (todo.isEmpty()) { log("Nothing selected. Tap files in the list (or 'Select all')."); return; }
-        final boolean dated = dateFolders.isChecked();
+        for (Item e : todo) bytes += e.size;
         if (!move) {
-            startWork(() -> transfer(todo, false, dated));
+            beginTransfer(todo, false, dest);
             return;
         }
         new AlertDialog.Builder(this)
-                .setTitle("Move " + todo.size() + " files?")
-                .setMessage(fmtSize(bytes) + " will be copied to the destination. Each original is deleted from the card only after its copy has been read back and checked. If anything fails, that original stays on the card.")
-                .setPositiveButton("Move", (d, w) -> startWork(() -> transfer(todo, true, dated)))
+                .setTitle("Move " + todo.size() + " file" + (todo.size() == 1 ? "" : "s") + "?")
+                .setMessage(Ui.fmtSize(bytes) + " will go to " + dest.path + ".\n\nEach original is deleted from the card "
+                        + "only after its copy has been read back and checked. If anything fails, that original stays on the card.")
+                .setPositiveButton("Move", (d, w) -> beginTransfer(todo, true, dest))
                 .setNegativeButton("Cancel", null)
                 .show();
     }
 
-    private DestDir openDestDir(ContentResolver cr, String docId) {
-        DestDir d = new DestDir();
-        d.docId = docId;
-        d.docUri = DocumentsContract.buildDocumentUriUsingTree(dstTree, docId);
-        Uri children = DocumentsContract.buildChildDocumentsUriUsingTree(dstTree, docId);
-        try (Cursor c = cr.query(children, new String[]{DocumentsContract.Document.COLUMN_DISPLAY_NAME}, null, null, null)) {
-            while (c != null && c.moveToNext()) d.names.add(c.getString(0).toLowerCase(Locale.ROOT));
+    private TextView pTitle, pLine1, pLine2, pCancel;
+    private ProgressBar pBar;
+    private LinearLayout pCard;
+    private final AtomicBoolean cancel = new AtomicBoolean();
+    private final AtomicLong doneBytes = new AtomicLong();
+    private volatile int curIndex;
+    private volatile String curName = "";
+    private long totalBytes, startedAt;
+    private int totalFiles;
+    private final Runnable progressTick = new Runnable() {
+        @Override public void run() {
+            if (!transferring || pBar == null) return;
+            long done = doneBytes.get();
+            pBar.setProgress(totalBytes > 0 ? (int) (done * 1000 / totalBytes) : 0);
+            pLine1.setText(Math.min(curIndex, totalFiles) + " of " + totalFiles + " · " + curName);
+            double secs = (SystemClock.elapsedRealtime() - startedAt) / 1000.0;
+            double speed = secs > 0.3 ? done / 1048576.0 / secs : 0;
+            String left = speed > 0.1 ? " · about " + fmtDuration((totalBytes - done) / 1048576.0 / speed) + " left" : "";
+            pLine2.setText(Ui.fmtSize(done) + " of " + Ui.fmtSize(totalBytes)
+                    + (speed > 0 ? String.format(Locale.US, " · %.1f MB/s", speed) : "") + left);
+            h.postDelayed(this, 250);
         }
-        return d;
-    }
-
-    private DestDir subDir(ContentResolver cr, DestDir parent, String name) throws IOException {
-        Uri children = DocumentsContract.buildChildDocumentsUriUsingTree(dstTree, parent.docId);
-        String[] proj = {DocumentsContract.Document.COLUMN_DOCUMENT_ID, DocumentsContract.Document.COLUMN_DISPLAY_NAME,
-                DocumentsContract.Document.COLUMN_MIME_TYPE};
-        try (Cursor c = cr.query(children, proj, null, null, null)) {
-            while (c != null && c.moveToNext()) {
-                if (name.equals(c.getString(1)) && DocumentsContract.Document.MIME_TYPE_DIR.equals(c.getString(2))) {
-                    return openDestDir(cr, c.getString(0));
-                }
-            }
-        }
-        Uri made;
-        try {
-            made = DocumentsContract.createDocument(cr, parent.docUri, DocumentsContract.Document.MIME_TYPE_DIR, name);
-        } catch (Exception e) {
-            throw new IOException("could not create folder " + name + ": " + e);
-        }
-        if (made == null) throw new IOException("could not create folder " + name);
-        return openDestDir(cr, DocumentsContract.getDocumentId(made));
-    }
-
-    private static String mimeFor(String name) {
-        int i = name.lastIndexOf('.');
-        if (i > 0) {
-            String m = MimeTypeMap.getSingleton().getMimeTypeFromExtension(name.substring(i + 1).toLowerCase(Locale.ROOT));
-            if (m != null) return m;
-        }
-        return "application/octet-stream";
-    }
-
-    private long queryLong(ContentResolver cr, Uri uri, String col) {
-        try (Cursor c = cr.query(uri, new String[]{col}, null, null, null)) {
-            if (c != null && c.moveToFirst() && !c.isNull(0)) return c.getLong(0);
-        }
-        return -1;
-    }
-
-    private String queryString(ContentResolver cr, Uri uri, String col) {
-        try (Cursor c = cr.query(uri, new String[]{col}, null, null, null)) {
-            if (c != null && c.moveToFirst()) return c.getString(0);
-        }
-        return null;
-    }
-
-    /** Copies one file, reads the copy back and compares size + CRC32. Deletes the partial copy and throws on any problem. */
-    private Uri copyAndVerify(ContentResolver cr, Entry e, DestDir d, byte[] buf) throws Exception {
-        Uri dest = null;
-        try {
-            dest = DocumentsContract.createDocument(cr, d.docUri, mimeFor(e.name), e.name);
-            if (dest == null) throw new IOException("could not create the destination file");
-            CRC32 crc = new CRC32();
-            long n = 0;
-            try (InputStream in = cr.openInputStream(e.uri); OutputStream out = cr.openOutputStream(dest, "w")) {
-                if (in == null || out == null) throw new IOException("could not open streams");
-                int r;
-                while ((r = in.read(buf)) > 0) {
-                    crc.update(buf, 0, r);
-                    out.write(buf, 0, r);
-                    n += r;
-                    if (cancel) throw new IOException("cancelled");
-                }
-                out.flush();
-            }
-            if (e.size > 0 && n != e.size) throw new IOException("read " + n + " bytes but the card lists " + e.size);
-            long destSize = queryLong(cr, dest, DocumentsContract.Document.COLUMN_SIZE);
-            if (destSize != n) throw new IOException("copy is " + destSize + " bytes, expected " + n);
-            CRC32 crc2 = new CRC32();
-            long m = 0;
-            try (InputStream in2 = cr.openInputStream(dest)) {
-                if (in2 == null) throw new IOException("could not read the copy back");
-                int r;
-                while ((r = in2.read(buf)) > 0) { crc2.update(buf, 0, r); m += r; }
-            }
-            if (m == n && crc2.getValue() != crc.getValue()) {
-                String tol = redactionTolerance(cr, e.uri, dest, buf);
-                if (tol != null) {
-                    log("  note: " + tol);
-                    m = -1; // handled: fall through to success
-                }
-            }
-            if (m != -1 && (m != n || crc2.getValue() != crc.getValue())) {
-                String why = diagnose(cr, e.uri, dest, buf, crc.getValue());
-                throw new IOException("verification failed: copy differs from original (wrote " + n + " B crc "
-                        + Long.toHexString(crc.getValue()) + ", read back " + m + " B crc " + Long.toHexString(crc2.getValue()) + "). " + why);
-            }
-            String finalName = queryString(cr, dest, DocumentsContract.Document.COLUMN_DISPLAY_NAME);
-            if (finalName != null && !finalName.equals(e.name)) log("  note: saved as '" + finalName + "' (name was changed by the system)");
-            return dest;
-        } catch (Exception ex) {
-            if (dest != null) {
-                try { DocumentsContract.deleteDocument(cr, dest); } catch (Exception ignored) { }
-            }
-            throw ex;
-        }
-    }
-
-    /** EXIF location tags that Android blanks when an app reads a photo back (privacy redaction). */
-    private static final String[] GPS_TAGS = {
-            android.media.ExifInterface.TAG_GPS_ALTITUDE, android.media.ExifInterface.TAG_GPS_ALTITUDE_REF,
-            android.media.ExifInterface.TAG_GPS_AREA_INFORMATION, android.media.ExifInterface.TAG_GPS_DOP,
-            android.media.ExifInterface.TAG_GPS_DATESTAMP, android.media.ExifInterface.TAG_GPS_DEST_BEARING,
-            android.media.ExifInterface.TAG_GPS_DEST_BEARING_REF, android.media.ExifInterface.TAG_GPS_DEST_DISTANCE,
-            android.media.ExifInterface.TAG_GPS_DEST_DISTANCE_REF, android.media.ExifInterface.TAG_GPS_DEST_LATITUDE,
-            android.media.ExifInterface.TAG_GPS_DEST_LATITUDE_REF, android.media.ExifInterface.TAG_GPS_DEST_LONGITUDE,
-            android.media.ExifInterface.TAG_GPS_DEST_LONGITUDE_REF, android.media.ExifInterface.TAG_GPS_DIFFERENTIAL,
-            "GPSHPositioningError", android.media.ExifInterface.TAG_GPS_IMG_DIRECTION,
-            android.media.ExifInterface.TAG_GPS_IMG_DIRECTION_REF, android.media.ExifInterface.TAG_GPS_LATITUDE,
-            android.media.ExifInterface.TAG_GPS_LATITUDE_REF, android.media.ExifInterface.TAG_GPS_LONGITUDE,
-            android.media.ExifInterface.TAG_GPS_LONGITUDE_REF, android.media.ExifInterface.TAG_GPS_MAP_DATUM,
-            android.media.ExifInterface.TAG_GPS_MEASURE_MODE, android.media.ExifInterface.TAG_GPS_PROCESSING_METHOD,
-            android.media.ExifInterface.TAG_GPS_SATELLITES, android.media.ExifInterface.TAG_GPS_SPEED,
-            android.media.ExifInterface.TAG_GPS_SPEED_REF, android.media.ExifInterface.TAG_GPS_STATUS,
-            android.media.ExifInterface.TAG_GPS_TIMESTAMP, android.media.ExifInterface.TAG_GPS_TRACK,
-            android.media.ExifInterface.TAG_GPS_TRACK_REF, android.media.ExifInterface.TAG_GPS_VERSION_ID,
     };
 
-    /**
-     * Called only when the read-back checksum differs. Accepts the copy ONLY if every differing byte lies inside a GPS tag
-     * of the original and reads back as zero (Android's location redaction). Returns a note if accepted, null if not.
-     */
-    private String redactionTolerance(ContentResolver cr, Uri src, Uri dest, byte[] buf) {
+    private static String fmtDuration(double s) {
+        if (s < 60) return Math.max(1, Math.round(s)) + " s";
+        long m = Math.round(s / 60);
+        return m + " min";
+    }
+
+    private void beginTransfer(final List<Item> todo, final boolean move, final Prefs.Dest dest) {
+        if (transferring) return;
+        while (!pages.isEmpty() && pages.peek() instanceof DestPicker) popPage();
+        prefs.pushRecent(dest);
+        transferring = true;
+        thumbs.paused = true;
+        cancel.set(false);
+        doneBytes.set(0);
+        curIndex = 0;
+        curName = "";
+        totalFiles = todo.size();
+        totalBytes = 0;
+        for (Item e : todo) totalBytes += e.size;
+        startedAt = SystemClock.elapsedRealtime();
+        showProgressOverlay(move);
+        getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        h.post(progressTick);
+        final boolean dated = prefs.dateFolders();
+        new Thread(() -> {
+            Result r = runTransfer(todo, move, dest, dated);
+            h.post(() -> {
+                transferring = false;
+                thumbs.paused = false;
+                getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                if (!r.moved.isEmpty()) items.removeAll(r.moved);
+                for (Item e : todo) e.selected = false;
+                applyFilter();
+                showResult(r, move, dest);
+            });
+        }, "transfer").start();
+    }
+
+    private static final class Result {
+        int copied, skipped, failed, deleted, deleteFailed;
+        long bytes, ms;
+        boolean cancelled;
+        String fatal;
+        final List<Item> moved = new ArrayList<>();
+        final List<String> failures = new ArrayList<>();
+    }
+
+    private Result runTransfer(List<Item> todo, boolean move, Prefs.Dest dest, boolean dated) {
+        Result r = new Result();
+        android.content.ContentResolver cr = getContentResolver();
+        log((move ? "MOVE " : "COPY ") + todo.size() + " files to " + dest.path + (dated ? " (date folders)" : ""));
+        long t0 = SystemClock.elapsedRealtime();
+        FileOps.DestDir root;
         try {
-            List<long[]> ranges = new ArrayList<>();
-            try (InputStream in = cr.openInputStream(src)) {
-                if (in == null) return null;
-                android.media.ExifInterface ei = new android.media.ExifInterface(in);
-                for (String tag : GPS_TAGS) {
-                    long[] r = ei.getAttributeRange(tag);
-                    if (r != null && r[1] > 0) ranges.add(r);
-                }
-            }
-            if (ranges.isEmpty()) return null;
-            byte[] bb = new byte[buf.length];
-            long off = 0, diffs = 0;
-            try (InputStream a = cr.openInputStream(src); InputStream b = cr.openInputStream(dest)) {
-                if (a == null || b == null) return null;
-                while (true) {
-                    int ra = readFully(a, buf), rb = readFully(b, bb);
-                    if (ra != rb) return null;
-                    for (int j = 0; j < ra; j++) {
-                        if (buf[j] == bb[j]) continue;
-                        long pos = off + j;
-                        boolean inside = false;
-                        for (long[] r : ranges) if (pos >= r[0] && pos < r[0] + r[1]) { inside = true; break; }
-                        if (!inside || bb[j] != 0) return null;
-                        diffs++;
-                    }
-                    off += ra;
-                    if (ra < buf.length) break;
-                }
-            }
-            return diffs + " bytes inside the photo's GPS location tags read back as zero (Android hides location data in "
-                    + "read-back). Everything else matched exactly.";
-        } catch (Throwable t) {
-            return null;
+            root = FileOps.openDestDir(cr, dest.tree, dest.docId);
+        } catch (Exception e) {
+            r.fatal = "Can't open the destination folder: " + e.getMessage();
+            log(r.fatal);
+            return r;
         }
-    }
-
-    private static int readFully(InputStream in, byte[] b) throws IOException {
-        int got = 0;
-        while (got < b.length) {
-            int r = in.read(b, got, b.length - got);
-            if (r <= 0) break;
-            got += r;
-        }
-        return got;
-    }
-
-    private static String hex(byte[] b, int from, int to, int mark) {
-        StringBuilder sb = new StringBuilder();
-        for (int i = from; i < to; i++) {
-            String h = String.format(Locale.US, "%02x", b[i] & 0xff);
-            sb.append(i == mark ? "[" + h + "]" : h).append(' ');
-        }
-        return sb.toString().trim();
-    }
-
-    /** Runs only after a failed check: re-reads the original and the copy and says where and how they differ. */
-    private String diagnose(ContentResolver cr, Uri src, Uri dest, byte[] buf, long firstCrc) {
-        try (InputStream a = cr.openInputStream(src); InputStream b = cr.openInputStream(dest)) {
-            byte[] bb = new byte[buf.length];
-            CRC32 crcA = new CRC32();
-            long off = 0, diffs = 0, first = -1, last = -1, lenA = 0, lenB = 0;
-            String hexA = "", hexB = "";
-            while (true) {
-                int ra = readFully(a, buf), rb = readFully(b, bb);
-                crcA.update(buf, 0, ra);
-                lenA += ra;
-                lenB += rb;
-                int mn = Math.min(ra, rb);
-                for (int j = 0; j < mn; j++) {
-                    if (buf[j] != bb[j]) {
-                        diffs++;
-                        if (first < 0) {
-                            first = off + j;
-                            int from = Math.max(0, j - 12), to = Math.min(mn, j + 14);
-                            hexA = hex(buf, from, to, j);
-                            hexB = hex(bb, from, to, j);
-                        }
-                        last = off + j;
-                    }
-                }
-                off += mn;
-                if (ra < buf.length || rb < buf.length) break;
-            }
-            return "Diagnosis: second read of original = " + lenA + " B, crc " + Long.toHexString(crcA.getValue())
-                    + (crcA.getValue() == firstCrc ? " (same as first read)" : " (DIFFERENT from first read)")
-                    + "; copy = " + lenB + " B; differing bytes = " + diffs
-                    + (diffs > 0 ? ", first at offset " + first + ", last at offset " + last
-                    + "; bytes around it (the [..] one differs): original " + hexA + " | copy " + hexB : "");
-        } catch (Exception ex) {
-            return "Diagnosis failed: " + ex;
-        }
-    }
-
-    private void transfer(List<Entry> todo, boolean move, boolean dated) {
-        ContentResolver cr = getContentResolver();
-        log((move ? "MOVE" : "COPY") + " " + todo.size() + " files" + (dated ? " into date folders" : "") + "...");
-        DestDir root = openDestDir(cr, DocumentsContract.getTreeDocumentId(dstTree));
-        Map<String, DestDir> dirs = new HashMap<>();
+        Map<String, FileOps.DestDir> dirs = new HashMap<>();
         SimpleDateFormat dayFmt = new SimpleDateFormat("yyyy-MM-dd", Locale.US);
         byte[] buf = new byte[1 << 20];
-        int copied = 0, skipped = 0, failed = 0, deleted = 0, i = 0;
-        long bytes = 0, copyMs = 0, delMs = 0;
-        boolean dateReported = false;
-        final List<Entry> moved = new ArrayList<>();
-        long t0 = SystemClock.elapsedRealtime();
-        for (Entry e : todo) {
+        long finishedBytes = 0;
+        int i = 0;
+        for (Item e : todo) {
             i++;
-            if (cancel) { log("Cancelled after " + (i - 1) + " of " + todo.size() + "."); break; }
-            final String st = (move ? "Moving " : "Copying ") + i + "/" + todo.size() + ": " + e.name;
-            ui.post(() -> selInfo.setText(st));
+            if (cancel.get()) { r.cancelled = true; log("Cancelled after " + (i - 1) + " of " + todo.size()); break; }
+            curIndex = i;
+            curName = e.name;
+            final long base = finishedBytes;
+            final long[] partial = {0};
             try {
-                DestDir d = root;
+                FileOps.DestDir d = root;
                 if (dated) {
                     String dn = dayFmt.format(new Date(e.mtime));
                     d = dirs.get(dn);
-                    if (d == null) { d = subDir(cr, root, dn); dirs.put(dn, d); }
+                    if (d == null) { d = FileOps.subDir(cr, root, dn); dirs.put(dn, d); }
                 }
                 if (d.names.contains(e.name.toLowerCase(Locale.ROOT))) {
-                    skipped++;
-                    log("  skipped (a file with this name is already there): " + e.name);
-                    continue;
+                    r.skipped++;
+                    log("  skipped (already there): " + e.name);
+                } else {
+                    long f0 = SystemClock.elapsedRealtime();
+                    FileOps.copyAndVerify(cr, e, d, buf, cancel, n -> { partial[0] += n; doneBytes.set(base + partial[0]); }, this::log);
+                    long f1 = SystemClock.elapsedRealtime();
+                    d.names.add(e.name.toLowerCase(Locale.ROOT));
+                    r.copied++;
+                    r.bytes += e.size;
+                    String line = String.format(Locale.US, "  ok %s (%s, %.1f MB/s incl. verify)", e.name, Ui.fmtSize(e.size),
+                            (f1 - f0) > 0 ? (e.size / 1048576.0) / ((f1 - f0) / 1000.0) : 0.0);
+                    if (move) {
+                        if (FileOps.delete(cr, e.uri)) { r.deleted++; r.moved.add(e); line += " -> original deleted"; }
+                        else { r.deleteFailed++; line += " -> could NOT delete original (copy is safe)"; }
+                    }
+                    log(line);
                 }
-                long f0 = SystemClock.elapsedRealtime();
-                Uri dest = copyAndVerify(cr, e, d, buf);
-                long f1 = SystemClock.elapsedRealtime();
-                d.names.add(e.name.toLowerCase(Locale.ROOT));
-                copied++;
-                bytes += e.size;
-                copyMs += f1 - f0;
-                if (!dateReported) {
-                    dateReported = true;
-                    long dm = queryLong(cr, dest, DocumentsContract.Document.COLUMN_LAST_MODIFIED);
-                    boolean same = dm > 0 && Math.abs(dm - e.mtime) < 2000;
-                    log("  file date on the copy: " + (dm > 0 ? fmtDateTime.format(new Date(dm)) : "unknown") + " vs original "
-                            + fmtDateTime.format(new Date(e.mtime)) + " -> original date " + (same ? "KEPT" : "NOT kept"));
-                }
-                String line = String.format(Locale.US, "  ok %s (%s, %.1f MB/s incl. verify)", e.name, fmtSize(e.size),
-                        (f1 - f0) > 0 ? (e.size / 1048576.0) / ((f1 - f0) / 1000.0) : 0.0);
-                if (move) {
-                    long x0 = SystemClock.elapsedRealtime();
-                    boolean gone;
-                    try { gone = DocumentsContract.deleteDocument(cr, e.uri); } catch (Exception dex) { gone = false; log("  delete error: " + dex); }
-                    delMs += SystemClock.elapsedRealtime() - x0;
-                    if (gone) { deleted++; moved.add(e); line += " -> original deleted"; }
-                    else line += " -> COULD NOT delete original (copy is safe)";
-                }
-                log(line);
             } catch (Exception ex) {
-                failed++;
+                if (cancel.get()) { r.cancelled = true; log("Cancelled during " + e.name + " (partial copy removed)"); break; }
+                r.failed++;
+                r.failures.add(e.name);
                 log("  FAILED " + e.name + ": " + ex.getMessage() + (move ? " (original kept)" : ""));
             }
+            finishedBytes += e.size;
+            doneBytes.set(finishedBytes);
         }
-        long total = SystemClock.elapsedRealtime() - t0;
-        log(String.format(Locale.US, "DONE: %d copied, %d skipped, %d failed%s. %s in %.1f s = %.1f MB/s%s",
-                copied, skipped, failed, move ? ", " + deleted + " originals deleted" : "",
-                fmtSize(bytes), total / 1000.0, total > 0 ? (bytes / 1048576.0) / (total / 1000.0) : 0.0,
-                move ? String.format(Locale.US, " (deleting took %.1f s)", delMs / 1000.0) : ""));
-        if (!moved.isEmpty()) ui.post(() -> { files.removeAll(moved); applyFilter(); });
+        r.ms = SystemClock.elapsedRealtime() - t0;
+        log(String.format(Locale.US, "DONE: %d copied, %d skipped, %d failed%s. %s in %.1f s = %.1f MB/s",
+                r.copied, r.skipped, r.failed, move ? ", " + r.deleted + " originals deleted" : "",
+                Ui.fmtSize(r.bytes), r.ms / 1000.0, r.ms > 0 ? (r.bytes / 1048576.0) / (r.ms / 1000.0) : 0.0));
+        return r;
     }
 
-    // ---------------------------------------------------------------- thumbnails
-
-    private final android.util.LruCache<String, Bitmap> thumbCache = new android.util.LruCache<String, Bitmap>(24 * 1024) {
-        @Override protected int sizeOf(String k, Bitmap b) { return b.getByteCount() / 1024; }
-    };
-    private final java.util.concurrent.ExecutorService thumbPool = java.util.concurrent.Executors.newFixedThreadPool(3);
-    private final Set<String> thumbPending = new HashSet<>();  // UI thread only
-    private final Set<String> thumbMissing = java.util.concurrent.ConcurrentHashMap.newKeySet();
-    private final java.util.concurrent.ConcurrentHashMap<String, Long> thumbSeen = new java.util.concurrent.ConcurrentHashMap<>();
-    private boolean thumbRefreshScheduled = false;
-    private final java.util.concurrent.atomic.AtomicInteger rawOk = new java.util.concurrent.atomic.AtomicInteger(),
-            rawFail = new java.util.concurrent.atomic.AtomicInteger(), picOk = new java.util.concurrent.atomic.AtomicInteger(),
-            picFail = new java.util.concurrent.atomic.AtomicInteger();
-    private final java.util.concurrent.atomic.AtomicLong rawMs = new java.util.concurrent.atomic.AtomicLong(),
-            picMs = new java.util.concurrent.atomic.AtomicLong();
-    private final java.util.concurrent.atomic.AtomicBoolean rawOkLogged = new java.util.concurrent.atomic.AtomicBoolean(),
-            rawFailLogged = new java.util.concurrent.atomic.AtomicBoolean(), picFailLogged = new java.util.concurrent.atomic.AtomicBoolean();
-
-    @Override
-    protected void onDestroy() {
-        super.onDestroy();
-        thumbPool.shutdownNow();
+    private void showProgressOverlay(boolean move) {
+        overlay = new FrameLayout(this);
+        overlay.setBackgroundColor(ui.scrim);
+        overlay.setClickable(true);
+        pCard = ui.vbox();
+        pCard.setBackground(ui.round(ui.surface, 24, 0));
+        pCard.setPadding(ui.px(24), ui.px(24), ui.px(24), ui.px(20));
+        pCard.setElevation(ui.px(12));
+        pTitle = ui.text(move ? "Moving photos" : "Copying photos", 20, ui.text, true);
+        pCard.addView(pTitle);
+        pBar = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
+        pBar.setMax(1000);
+        pBar.setProgressTintList(ColorStateList.valueOf(ui.accent));
+        LinearLayout.LayoutParams bp = Ui.lp(Ui.MATCH, ui.px(12));
+        bp.setMargins(0, ui.px(20), 0, ui.px(12));
+        pCard.addView(pBar, bp);
+        pLine1 = ui.text("Starting…", 15, ui.text, false);
+        pLine1.setSingleLine(true);
+        pLine1.setEllipsize(android.text.TextUtils.TruncateAt.MIDDLE);
+        pCard.addView(pLine1);
+        pLine2 = ui.text("", 13, ui.textDim, false);
+        pLine2.setPadding(0, ui.px(4), 0, 0);
+        pCard.addView(pLine2);
+        pCancel = ui.secondaryButton("Cancel", v -> {
+            cancel.set(true);
+            pCancel.setText("Cancelling…");
+            pCancel.setEnabled(false);
+        });
+        LinearLayout.LayoutParams cp = Ui.lp(Ui.MATCH, Ui.WRAP);
+        cp.setMargins(0, ui.px(20), 0, 0);
+        pCard.addView(pCancel, cp);
+        FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(Ui.MATCH, Ui.WRAP, Gravity.CENTER);
+        lp.setMargins(ui.px(24), 0, ui.px(24), 0);
+        overlay.addView(pCard, lp);
+        host.addView(overlay, new FrameLayout.LayoutParams(Ui.MATCH, Ui.MATCH));
     }
 
-    private void bindThumb(ImageView iv, Entry e) {
-        final String key = e.uri.toString();
-        iv.setTag(key);
-        Bitmap b = thumbCache.get(key);
-        if (b != null) { iv.setImageBitmap(b); return; }
-        iv.setImageDrawable(new ColorDrawable(0xFFDDDDDD));
-        if (e.type == T_OTHER || thumbMissing.contains(key)) return;
-        thumbSeen.put(key, SystemClock.elapsedRealtime());
-        if (!thumbPending.add(key)) return;
-        final Entry fe = e;
-        try {
-            thumbPool.execute(() -> {
-                Long seen = thumbSeen.get(key);
-                boolean wanted = seen != null && SystemClock.elapsedRealtime() - seen < 2500;
-                if (!wanted || busy) { ui.post(() -> thumbPending.remove(key)); return; }
-                final Bitmap bm = loadThumb(fe);
-                ui.post(() -> {
-                    thumbPending.remove(key);
-                    if (bm != null) thumbCache.put(key, bm); else thumbMissing.add(key);
-                    if (!thumbRefreshScheduled) {
-                        thumbRefreshScheduled = true;
-                        ui.postDelayed(() -> { thumbRefreshScheduled = false; adapter.notifyDataSetChanged(); }, 80);
-                    }
-                });
-            });
-        } catch (Exception ex) {
-            thumbPending.remove(key);
-        }
-    }
-
-    private Bitmap loadThumb(Entry e) {
-        ContentResolver cr = getContentResolver();
-        long t0 = SystemClock.elapsedRealtime();
-        Bitmap bm = null;
-        String err = null;
-        try {
-            if (e.type == T_RAW) {
-                bm = rawPreview(cr, e.uri);
-            } else {
-                try { bm = DocumentsContract.getDocumentThumbnail(cr, e.uri, new Point(200, 200), null); } catch (Exception ex) { err = ex.toString(); }
-                if (bm == null) bm = decodeSampled(cr, e.uri, 200);
-            }
-        } catch (Throwable t) {
-            err = t.getMessage() != null ? t.getMessage() : t.toString();
-        }
-        long ms = SystemClock.elapsedRealtime() - t0;
-        if (e.type == T_RAW) {
-            if (bm != null) {
-                rawOk.incrementAndGet(); rawMs.addAndGet(ms);
-                if (rawOkLogged.compareAndSet(false, true)) log("First RAW preview: " + e.name + " " + bm.getWidth() + "x" + bm.getHeight() + " in " + ms + " ms");
-            } else {
-                rawFail.incrementAndGet();
-                if (rawFailLogged.compareAndSet(false, true)) log("RAW preview failed for " + e.name + ": " + err);
-            }
+    private void showResult(Result r, boolean move, Prefs.Dest dest) {
+        if (overlay == null) return;
+        h.removeCallbacks(progressTick);
+        pCard.removeAllViews();
+        boolean problems = r.failed > 0 || r.deleteFailed > 0 || r.fatal != null;
+        String head = r.fatal != null ? "Couldn't start" : r.cancelled ? "Stopped" : problems ? "Finished with problems" : "Done";
+        pCard.addView(ui.text(head, 22, problems ? ui.danger : ui.text, true));
+        StringBuilder sb = new StringBuilder();
+        if (r.fatal != null) {
+            sb.append(r.fatal);
         } else {
-            if (bm != null) { picOk.incrementAndGet(); picMs.addAndGet(ms); }
-            else {
-                picFail.incrementAndGet();
-                if (picFailLogged.compareAndSet(false, true)) log("Thumbnail failed for " + e.name + ": " + err);
+            sb.append(r.copied).append(r.copied == 1 ? " file " : " files ").append(move ? "moved" : "copied")
+                    .append(" to ").append(dest.path).append(".");
+            if (r.copied > 0) sb.append(String.format(Locale.US, "\n%s in %.1f s", Ui.fmtSize(r.bytes), r.ms / 1000.0));
+            if (r.skipped > 0) sb.append("\n").append(r.skipped).append(" skipped: a file with the same name was already there.");
+            if (r.failed > 0) sb.append("\n").append(r.failed).append(" failed").append(move ? " (originals kept on the card)" : "")
+                    .append(": ").append(join(r.failures, 4)).append(".");
+            if (r.deleteFailed > 0) sb.append("\n").append(r.deleteFailed).append(" copied but the original could not be deleted.");
+            if (r.cancelled) sb.append("\nYou cancelled before the rest were done.");
+        }
+        TextView body = ui.text(sb.toString(), 15, ui.textDim, false);
+        body.setPadding(0, ui.px(12), 0, 0);
+        body.setLineSpacing(0, 1.15f);
+        pCard.addView(body);
+        LinearLayout btns = ui.hbox();
+        btns.setGravity(Gravity.END);
+        if (problems) btns.addView(ui.flatButton("Show log", v -> { closeOverlay(); pushPage(new LogPage()); }));
+        btns.addView(ui.primaryButton("Done", v -> closeOverlay()));
+        LinearLayout.LayoutParams bp = Ui.lp(Ui.MATCH, Ui.WRAP);
+        bp.setMargins(0, ui.px(20), 0, 0);
+        pCard.addView(btns, bp);
+    }
+
+    private static String join(List<String> names, int max) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < names.size() && i < max; i++) { if (i > 0) sb.append(", "); sb.append(names.get(i)); }
+        if (names.size() > max) sb.append(" and ").append(names.size() - max).append(" more");
+        return sb.toString();
+    }
+
+    private void closeOverlay() {
+        if (overlay != null) host.removeView(overlay);
+        overlay = null;
+        pBar = null;
+    }
+
+    // ================================================================== settings page
+
+    private final class SettingsPage implements Page {
+        private final LinearLayout root = ui.vbox();
+        private final LinearLayout body = ui.vbox();
+
+        SettingsPage() {
+            root.setBackgroundColor(ui.bg);
+            root.addView(pageBar("Settings", null), Ui.lp(Ui.MATCH, Ui.WRAP));
+            ScrollView sv = new ScrollView(MainActivity.this);
+            sv.addView(body, new FrameLayout.LayoutParams(Ui.MATCH, Ui.WRAP));
+            root.addView(sv, new LinearLayout.LayoutParams(Ui.MATCH, 0, 1f));
+            refresh();
+        }
+
+        @Override public View view() { return root; }
+
+        private LinearLayout card() {
+            LinearLayout c = ui.vbox();
+            c.setBackground(ui.round(ui.surface, 16, 0));
+            LinearLayout.LayoutParams p = Ui.lp(Ui.MATCH, Ui.WRAP);
+            p.setMargins(ui.px(12), 0, ui.px(12), 0);
+            c.setLayoutParams(p);
+            return c;
+        }
+
+        @Override
+        public void refresh() {
+            body.removeAllViews();
+
+            body.addView(ui.sectionHeader("Camera card"));
+            LinearLayout c1 = card();
+            Uri cardUri = prefs.card();
+            c1.addView(ui.listRow("💾", "Card folder", cardUri == null ? "Not set - tap to choose" : Prefs.rootLabel(cardUri),
+                    null, v -> pickCard()));
+            c1.addView(ui.divider());
+            c1.addView(ui.listRow("⟳", "Rescan card", scanning ? "Reading…" : items.size() + " files found",
+                    null, v -> startScan()));
+            body.addView(c1);
+
+            body.addView(ui.sectionHeader("Destination folders"));
+            TextView expl = ui.text("Add a top folder once (for example Pictures or DCIM on the phone). When you copy, you "
+                    + "pick or create sub-folders inside it with the app's own folder browser.", 13, ui.textDim, false);
+            expl.setPadding(ui.px(16), 0, ui.px(16), ui.px(8));
+            body.addView(expl);
+            LinearLayout c2 = card();
+            List<Uri> roots = prefs.roots();
+            for (Uri u : roots) {
+                TextView remove = ui.flatButton("Remove", v -> new AlertDialog.Builder(MainActivity.this)
+                        .setTitle("Remove " + Prefs.rootLabel(u) + "?")
+                        .setMessage("The app will no longer be able to save into this folder. Files already there are not touched.")
+                        .setPositiveButton("Remove", (d, w) -> { prefs.removeRoot(u); refresh(); })
+                        .setNegativeButton("Cancel", null).show());
+                c2.addView(ui.listRow("📁", Prefs.rootLabel(u), null, remove, null));
+                c2.addView(ui.divider());
             }
-        }
-        return bm;
-    }
-
-    private void thumbStats() {
-        int ro = rawOk.get(), rf = rawFail.get(), po = picOk.get(), pf = picFail.get();
-        log("Thumbnails so far: RAW " + ro + " ok / " + rf + " failed" + (ro > 0 ? ", avg " + (rawMs.get() / ro) + " ms" : "")
-                + "; JPEG/PNG " + po + " ok / " + pf + " failed" + (po > 0 ? ", avg " + (picMs.get() / po) + " ms" : "")
-                + "; cached " + thumbCache.size() / 1024 + " MB");
-    }
-
-    private static Bitmap decodeSampled(ContentResolver cr, Uri uri, int target) throws IOException {
-        BitmapFactory.Options o = new BitmapFactory.Options();
-        o.inJustDecodeBounds = true;
-        try (InputStream in = cr.openInputStream(uri)) { BitmapFactory.decodeStream(in, null, o); }
-        int mx = Math.max(o.outWidth, o.outHeight);
-        if (mx <= 0) return null;
-        int sample = 1;
-        while (mx / (sample * 2) >= target) sample *= 2;
-        BitmapFactory.Options o2 = new BitmapFactory.Options();
-        o2.inSampleSize = sample;
-        try (InputStream in = cr.openInputStream(uri)) { return BitmapFactory.decodeStream(in, null, o2); }
-    }
-
-    // ---- RAW (TIFF-based, e.g. NEF): find the JPEG preview stored inside the file and decode a small version of it
-
-    private static byte[] readAt(FileChannel ch, long pos, int len) throws IOException {
-        if (len < 0 || len > 64 * 1024 * 1024) throw new IOException("bad read length " + len);
-        ByteBuffer bb = ByteBuffer.allocate(len);
-        while (bb.hasRemaining()) {
-            int r = ch.read(bb, pos + bb.position());
-            if (r <= 0) break;
-        }
-        return bb.position() == len ? bb.array() : java.util.Arrays.copyOf(bb.array(), bb.position());
-    }
-
-    private static int u16(byte[] b, int o, ByteOrder bo) { return ByteBuffer.wrap(b).order(bo).getShort(o) & 0xffff; }
-
-    private static long u32(byte[] b, int o, ByteOrder bo) { return ByteBuffer.wrap(b).order(bo).getInt(o) & 0xffffffffL; }
-
-    private static void walkIfd(FileChannel ch, long size, ByteOrder bo, long off, int depth, boolean ifd0,
-                                List<long[]> cands, int[] orient, Set<Long> seen) throws IOException {
-        if (off <= 0 || off + 2 > size || depth > 3 || !seen.add(off)) return;
-        byte[] cb = readAt(ch, off, 2);
-        if (cb.length < 2) return;
-        int count = u16(cb, 0, bo);
-        if (count == 0 || count > 600) return;
-        byte[] buf = readAt(ch, off + 2, count * 12 + 4);
-        if (buf.length < count * 12 + 4) return;
-        long jpgOff = -1, jpgLen = -1, stripOff = -1, stripLen = -1, subVal = 0, subCnt = 0, stripOffCnt = 0, stripLenCnt = 0;
-        int comp = -1;
-        for (int i = 0; i < count; i++) {
-            int o = i * 12;
-            int tag = u16(buf, o, bo), type = u16(buf, o + 2, bo);
-            long cnt = u32(buf, o + 4, bo);
-            long val = (type == 3 && cnt == 1) ? u16(buf, o + 8, bo) : u32(buf, o + 8, bo);
-            switch (tag) {
-                case 0x0201: jpgOff = val; break;
-                case 0x0202: jpgLen = val; break;
-                case 0x0103: comp = (int) val; break;
-                case 0x0111: stripOff = val; stripOffCnt = cnt; break;
-                case 0x0117: stripLen = val; stripLenCnt = cnt; break;
-                case 0x014a: subVal = val; subCnt = cnt; break;
-                case 0x0112: if (ifd0 && depth == 0) orient[0] = (int) val; break;
-                default: break;
+            c2.addView(ui.listRow("＋", "Add destination folder", "Uses Android's folder picker, just this once", null, v -> pickRoot()));
+            if (!prefs.recents().isEmpty()) {
+                c2.addView(ui.divider());
+                c2.addView(ui.listRow("🕘", "Clear recent destinations", null, null, v -> { prefs.clearRecents(); refresh(); }));
             }
-        }
-        if (jpgOff > 0 && jpgLen > 0) cands.add(new long[]{jpgOff, jpgLen});
-        if ((comp == 6 || comp == 7) && stripOff > 0 && stripLen > 0 && stripOffCnt == 1 && stripLenCnt == 1) {
-            cands.add(new long[]{stripOff, stripLen});
-        }
-        if (subCnt == 1) {
-            walkIfd(ch, size, bo, subVal, depth + 1, false, cands, orient, seen);
-        } else if (subCnt > 1 && subCnt <= 8 && subVal + subCnt * 4 <= size) {
-            byte[] sb = readAt(ch, subVal, (int) subCnt * 4);
-            for (int i = 0; i + 4 <= sb.length; i += 4) {
-                walkIfd(ch, size, bo, u32(sb, i, bo), depth + 1, false, cands, orient, seen);
-            }
-        }
-        long next = u32(buf, count * 12, bo);
-        if (depth == 0 && ifd0 && next > 0) walkIfd(ch, size, bo, next, 0, false, cands, orient, seen);
-    }
+            body.addView(c2);
 
-    private static Bitmap rawPreview(ContentResolver cr, Uri uri) throws IOException {
-        try (ParcelFileDescriptor pfd = cr.openFileDescriptor(uri, "r")) {
-            if (pfd == null) throw new IOException("could not open the file");
-            FileChannel ch = new FileInputStream(pfd.getFileDescriptor()).getChannel();
-            long size = ch.size();
-            byte[] head = readAt(ch, 0, 8);
-            if (head.length < 8) throw new IOException("file too short");
-            ByteOrder bo;
-            if (head[0] == 0x49 && head[1] == 0x49) bo = ByteOrder.LITTLE_ENDIAN;
-            else if (head[0] == 0x4d && head[1] == 0x4d) bo = ByteOrder.BIG_ENDIAN;
-            else throw new IOException("not a TIFF-based RAW file");
-            if (u16(head, 2, bo) != 42) throw new IOException("not a TIFF-based RAW file");
-            List<long[]> cands = new ArrayList<>();
-            int[] orient = {1};
-            walkIfd(ch, size, bo, u32(head, 4, bo), 0, true, cands, orient, new HashSet<Long>());
-            java.util.Collections.sort(cands, (a, b) -> Long.compare(a[1], b[1]));  // smallest first
-            byte[] fallback = null;
-            int fallbackMax = 0;
-            Bitmap best = null;
-            for (long[] c : cands) {
-                if (c[1] < 500 || c[0] + c[1] > size) continue;
-                byte[] jpg = readAt(ch, c[0], (int) c[1]);
-                if (jpg.length < 2 || (jpg[0] & 0xff) != 0xff || (jpg[1] & 0xff) != 0xd8) continue;
-                BitmapFactory.Options o = new BitmapFactory.Options();
-                o.inJustDecodeBounds = true;
-                BitmapFactory.decodeByteArray(jpg, 0, jpg.length, o);
-                int mx = Math.max(o.outWidth, o.outHeight);
-                if (mx <= 0) continue;
-                if (mx >= 400) { best = decodeJpegSampled(jpg, mx); if (best != null) break; }
-                else if (mx > fallbackMax) { fallback = jpg; fallbackMax = mx; }
-            }
-            if (best == null && fallback != null) best = decodeJpegSampled(fallback, fallbackMax);
-            if (best == null) throw new IOException("no JPEG preview found inside the RAW file (" + cands.size() + " candidates)");
-            return rotateForOrientation(best, orient[0]);
+            body.addView(ui.sectionHeader("Copying"));
+            LinearLayout c3 = card();
+            Switch sw = new Switch(MainActivity.this);
+            sw.setChecked(prefs.dateFolders());
+            sw.setOnCheckedChangeListener((v, on) -> prefs.setDateFolders(on));
+            c3.addView(ui.listRow("📅", "Sort into date folders", "Creates YYYY-MM-DD folders from the card's file dates",
+                    sw, v -> sw.toggle()));
+            c3.addView(ui.divider());
+            c3.addView(ui.listRow("✔", "Every copy is verified", "Files already at the destination are skipped, never "
+                    + "overwritten. Move deletes an original only after its copy checks out.", null, null));
+            body.addView(c3);
+
+            body.addView(ui.sectionHeader("Gallery"));
+            LinearLayout c4 = card();
+            c4.addView(ui.listRow("▦", "Grid columns", String.valueOf(prefs.columns()), null, v -> {
+                final String[] opts = {"3", "4", "5", "6"};
+                new AlertDialog.Builder(MainActivity.this).setTitle("Grid columns")
+                        .setSingleChoiceItems(opts, prefs.columns() - 3, (d, which) -> {
+                            prefs.setColumns(which + 3);
+                            applyFilter();
+                            refresh();
+                            d.dismiss();
+                        }).show();
+            }));
+            body.addView(c4);
+
+            body.addView(ui.sectionHeader("Diagnostics"));
+            LinearLayout c5 = card();
+            c5.addView(ui.listRow("📝", "Activity log", "Details of scans and transfers, and a copyable report",
+                    null, v -> pushPage(new LogPage())));
+            c5.addView(ui.divider());
+            c5.addView(ui.listRow("🖼", "Thumbnail stats", thumbs.stats(), null, v -> refresh()));
+            body.addView(c5);
+
+            TextView about = ui.text("SD Importer " + versionName(), 13, ui.textDim, false);
+            about.setGravity(Gravity.CENTER);
+            about.setPadding(0, ui.px(24), 0, ui.px(32));
+            body.addView(about, Ui.lp(Ui.MATCH, Ui.WRAP));
         }
     }
 
-    private static Bitmap decodeJpegSampled(byte[] jpg, int mx) {
-        int sample = 1;
-        while (mx / (sample * 2) >= 240) sample *= 2;
-        BitmapFactory.Options o = new BitmapFactory.Options();
-        o.inSampleSize = sample;
-        return BitmapFactory.decodeByteArray(jpg, 0, jpg.length, o);
-    }
+    // ================================================================== log page
 
-    private static Bitmap rotateForOrientation(Bitmap b, int orientation) {
-        int deg = orientation == 3 ? 180 : orientation == 6 ? 90 : orientation == 8 ? 270 : 0;
-        if (deg == 0) return b;
-        Matrix m = new Matrix();
-        m.postRotate(deg);
-        return Bitmap.createBitmap(b, 0, 0, b.getWidth(), b.getHeight(), m, true);
-    }
+    private View logPageView;
 
-    // ---------------------------------------------------------------- misc
+    private final class LogPage implements Page {
+        private final LinearLayout root = ui.vbox();
 
-    private static String fmtSize(long n) {
-        if (n >= 1073741824L) return String.format(Locale.US, "%.2f GB", n / 1073741824.0);
-        if (n >= 1048576L) return String.format(Locale.US, "%.1f MB", n / 1048576.0);
-        if (n >= 1024) return (n / 1024) + " KB";
-        return n + " B";
+        LogPage() {
+            root.setBackgroundColor(ui.bg);
+            root.addView(pageBar("Activity log", null, ui.flatButton("Copy", v -> copyReport())), Ui.lp(Ui.MATCH, Ui.WRAP));
+            ScrollView sv = new ScrollView(MainActivity.this);
+            TextView tv = ui.text("", 12, ui.text, false);
+            tv.setTypeface(Typeface.MONOSPACE);
+            tv.setTextIsSelectable(true);
+            tv.setPadding(ui.px(12), ui.px(12), ui.px(12), ui.px(24));
+            synchronized (report) { tv.setText(report.toString()); }
+            sv.addView(tv);
+            root.addView(sv, new LinearLayout.LayoutParams(Ui.MATCH, 0, 1f));
+            logView = tv;
+            logPageView = root;
+            sv.post(() -> sv.fullScroll(View.FOCUS_DOWN));
+        }
+
+        @Override public View view() { return root; }
     }
 
     private void copyReport() {
         ClipboardManager cm = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
         String text;
         synchronized (report) { text = report.toString(); }
-        cm.setPrimaryClip(ClipData.newPlainText("report", text));
-        log("Report copied to clipboard. Paste it into the chat.");
+        cm.setPrimaryClip(ClipData.newPlainText("SD Importer report", text));
+        Toast.makeText(this, "Report copied", Toast.LENGTH_SHORT).show();
     }
 
-    private void log(final String msg) {
+    void log(final String msg) {
         final String line = new SimpleDateFormat("HH:mm:ss", Locale.US).format(new Date()) + "  " + msg + "\n";
         synchronized (report) { report.append(line); }
-        ui.post(() -> {
-            logView.append(line);
-            logScroll.post(() -> logScroll.fullScroll(View.FOCUS_DOWN));
-        });
+        h.post(() -> { if (logView != null) logView.append(line); });
     }
 }

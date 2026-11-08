@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- SD card body with the cut corner -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M42,30H62L72,40V74A4,4 0,0 1,68 78H40A4,4 0,0 1,36 74V36A6,6 0,0 1,42 30Z" />
+    <!-- contacts -->
+    <path
+        android:fillColor="#1F6FEB"
+        android:pathData="M44,34h3v8h-3z M50,34h3v8h-3z M56,34h3v8h-3z" />
+    <!-- arrow: import -->
+    <path
+        android:strokeColor="#1F6FEB"
+        android:strokeWidth="3.5"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:pathData="M54,50V68M47,61L54,68L61,61" />
+</vector>
