@@ -318,9 +318,14 @@ public class MainActivity extends Activity {
         int start, count;
     }
 
+    /** Columns shown right now: the saved setting, or the target of a pinch in progress. */
+    private int gridCols = -1;
+
+    int cols() { return gridCols > 0 ? gridCols : prefs.columns(); }
+
     private void rebuildRows() {
         rows.clear();
-        int cols = prefs.columns();
+        int cols = cols();
         boolean group = sort == 0 || sort == 1;
         int i = 0;
         while (i < shown.size()) {
@@ -709,7 +714,7 @@ public class MainActivity extends Activity {
             }
 
             TileRow tr = (TileRow) r;
-            int cols = prefs.columns();
+            int cols = cols();
             int w = list.getWidth() > 0 ? list.getWidth() : getResources().getDisplayMetrics().widthPixels;
             int tile = w / cols;
             RowHolder rh = convert != null ? (RowHolder) convert.getTag() : null;
@@ -830,26 +835,28 @@ public class MainActivity extends Activity {
 
         private final android.view.ScaleGestureDetector pinch;
         private boolean pinching, pinchCancelSent;
-        private float pinchAcc = 1f;
+        private float pinchCum = 1f;
 
         DragListView(Context c) {
             super(c);
             pinch = new android.view.ScaleGestureDetector(c, new android.view.ScaleGestureDetector.SimpleOnScaleGestureListener() {
                 @Override public boolean onScaleBegin(android.view.ScaleGestureDetector d) {
                     pinching = true;
-                    pinchAcc = 1f;
+                    pinchCum = 1f;
+                    pinchBegin();
                     return true;
                 }
 
                 @Override public boolean onScale(android.view.ScaleGestureDetector d) {
-                    pinchAcc *= d.getScaleFactor();
-                    // spreading fingers = zoom in = fewer, bigger thumbnails; pinching = more, smaller
-                    if (pinchAcc > 1.3f) { changeColumns(-1, d.getFocusX(), d.getFocusY()); pinchAcc = 1f; }
-                    else if (pinchAcc < 0.77f) { changeColumns(+1, d.getFocusX(), d.getFocusY()); pinchAcc = 1f; }
+                    pinchCum *= d.getScaleFactor();
+                    pinchUpdate(pinchCum, d.getFocusX(), d.getFocusY());
                     return true;
                 }
 
-                @Override public void onScaleEnd(android.view.ScaleGestureDetector d) { pinching = false; }
+                @Override public void onScaleEnd(android.view.ScaleGestureDetector d) {
+                    pinching = false;
+                    pinchEnd();
+                }
             });
         }
 
@@ -926,7 +933,7 @@ public class MainActivity extends Activity {
         }
 
         private int indexAt(float x, float y) {
-            int cols = prefs.columns();
+            int cols = cols();
             for (int c = 0; c < getChildCount(); c++) {
                 View ch = getChildAt(c);
                 if (y < ch.getTop() || y >= ch.getBottom()) continue;
@@ -955,71 +962,166 @@ public class MainActivity extends Activity {
         }
     }
 
+    // ---- pinch-to-resize: the old and new grid cross-fade and zoom following the fingers.
+    // Spreading = fewer, bigger thumbnails; pinching = more, smaller. Release past halfway to keep the change.
+
     private ImageView gridSnapshot;
+    private int pinchFrom = 0, pinchTo = 0, pinchFirstItem = -1;
+    private float pinchBase = 1f, pinchP = 0f, pinchFx, pinchFy;
+    private android.animation.ValueAnimator pinchAnim;
 
-    /** Pinch on the gallery: +1 = more columns (smaller thumbnails), -1 = fewer. Cross-fades old and new grid. */
-    private void changeColumns(int delta, float fx, float fy) {
-        int cols = prefs.columns(), n = Math.max(2, Math.min(7, cols + delta));
-        if (n == cols) return;
-        int firstItem = -1;
+    private void pinchBegin() {
+        if (pinchAnim != null) pinchAnim.end();
+        pinchBase = 1f;
+        pinchTo = 0;
+        pinchP = 0f;
+    }
+
+    private void pinchUpdate(float cum, float fx, float fy) {
+        pinchFx = fx;
+        pinchFy = fy;
+        float rel = cum / pinchBase;
+        if (pinchTo == 0) {
+            if (rel > 1.04f) startPinchStep(-1);
+            else if (rel < 0.96f) startPinchStep(+1);
+            if (pinchTo == 0) return;
+        }
+        float ratio = pinchFrom / (float) pinchTo;  // > 1 when thumbnails get bigger
+        float p = ratio > 1 ? (rel - 1f) / (ratio - 1f) : (1f - rel) / (1f - ratio);
+        if (p < -0.2f) {  // fingers went back past the start and beyond: switch direction
+            abortPinchStep();
+            pinchUpdate(cum, fx, fy);
+            return;
+        }
+        setPinchProgress(Math.max(0f, Math.min(1f, p)));
+        boolean overshoot = ratio > 1 ? rel > ratio * 1.12f : rel < ratio / 1.12f;
+        if (p >= 1f && overshoot) {  // kept going: lock this step in and start the next one
+            commitPinchStep();
+            pinchBase = cum;
+        }
+    }
+
+    private void pinchEnd() {
+        if (pinchTo == 0) return;
+        final boolean keep = pinchP >= 0.5f;
+        pinchAnim = android.animation.ValueAnimator.ofFloat(pinchP, keep ? 1f : 0f);
+        pinchAnim.setDuration((long) (80 + 200 * Math.abs((keep ? 1f : 0f) - pinchP)));
+        pinchAnim.setInterpolator(new android.view.animation.DecelerateInterpolator());
+        pinchAnim.addUpdateListener(an -> setPinchProgress((float) an.getAnimatedValue()));
+        pinchAnim.addListener(new android.animation.AnimatorListenerAdapter() {
+            private boolean done;
+
+            @Override public void onAnimationEnd(android.animation.Animator an) {
+                if (done) return;
+                done = true;
+                if (pinchTo == 0) return;
+                if (keep) commitPinchStep(); else abortPinchStep();
+            }
+        });
+        pinchAnim.start();
+    }
+
+    private int firstVisibleItem() {
         int pos = list.getFirstVisiblePosition();
-        for (int i = pos; i < rows.size() && firstItem < 0; i++) {
+        for (int i = Math.max(0, pos); i < rows.size(); i++) {
             Object r = rows.get(i);
-            if (r instanceof TileRow) firstItem = ((TileRow) r).start;
-            else if (r instanceof Header) firstItem = ((Header) r).start;
+            if (r instanceof TileRow) return ((TileRow) r).start;
+            if (r instanceof Header) return ((Header) r).start;
         }
+        return -1;
+    }
 
-        // freeze the current grid as a picture laid over the list
+    private void scrollToItem(int item) {
+        if (item < 0) return;
+        for (int i = 0; i < rows.size(); i++) {
+            Object r = rows.get(i);
+            if (r instanceof TileRow && ((TileRow) r).start + ((TileRow) r).count > item) { list.setSelection(i); return; }
+        }
+    }
+
+    /** Freezes the current grid as a picture on top, then lays out the target column count underneath. */
+    private void startPinchStep(int delta) {
+        int from = cols(), to = Math.max(2, Math.min(7, from + delta));
+        if (to == from || list.getWidth() == 0 || list.getHeight() == 0) { pinchTo = 0; return; }
         FrameLayout parent = (FrameLayout) list.getParent();
-        if (gridSnapshot != null) { gridSnapshot.animate().cancel(); parent.removeView(gridSnapshot); gridSnapshot = null; }
-        list.animate().cancel();
-        if (list.getWidth() > 0 && list.getHeight() > 0) {
-            try {
-                android.graphics.Bitmap snap = android.graphics.Bitmap.createBitmap(list.getWidth(), list.getHeight(),
-                        android.graphics.Bitmap.Config.ARGB_8888);
-                android.graphics.Canvas cv = new android.graphics.Canvas(snap);
-                cv.drawColor(ui.bg);
-                list.setAlpha(1f);
-                list.setScaleX(1f);
-                list.setScaleY(1f);
-                list.draw(cv);
-                gridSnapshot = new ImageView(this);
-                gridSnapshot.setImageBitmap(snap);
-                parent.addView(gridSnapshot, 1, new FrameLayout.LayoutParams(Ui.MATCH, Ui.MATCH));
-            } catch (Throwable ignored) { gridSnapshot = null; }
+        removeGridSnapshot();
+        list.setAlpha(1f);
+        list.setScaleX(1f);
+        list.setScaleY(1f);
+        try {
+            android.graphics.Bitmap snap = android.graphics.Bitmap.createBitmap(list.getWidth(), list.getHeight(),
+                    android.graphics.Bitmap.Config.ARGB_8888);
+            android.graphics.Canvas cv = new android.graphics.Canvas(snap);
+            cv.drawColor(ui.bg);
+            list.draw(cv);
+            gridSnapshot = new ImageView(this);
+            gridSnapshot.setImageBitmap(snap);
+            parent.addView(gridSnapshot, 1, new FrameLayout.LayoutParams(Ui.MATCH, Ui.MATCH));
+        } catch (Throwable t) {
+            pinchTo = 0;
+            return;
         }
-
-        prefs.setColumns(n);
+        pinchFirstItem = firstVisibleItem();
+        pinchFrom = from;
+        pinchTo = to;
+        gridCols = to;
         rebuildRows();
         adapter.notifyDataSetChanged();
-        if (firstItem >= 0) {
-            for (int i = 0; i < rows.size(); i++) {
-                Object r = rows.get(i);
-                if (r instanceof TileRow && ((TileRow) r).start + ((TileRow) r).count > firstItem) { list.setSelection(i); break; }
-            }
-        }
+        scrollToItem(pinchFirstItem);
+        setPinchProgress(0f);
+    }
 
-        // old grid grows/shrinks and fades out while the new one settles in from the opposite size
-        float ratio = cols / (float) n;  // > 1 when thumbnails get bigger
-        final ImageView snapView = gridSnapshot;
-        if (snapView != null) {
-            snapView.setPivotX(fx);
-            snapView.setPivotY(fy);
-            snapView.animate().alpha(0f).scaleX(ratio).scaleY(ratio).setDuration(260)
-                    .setInterpolator(new android.view.animation.DecelerateInterpolator())
-                    .withEndAction(() -> {
-                        parent.removeView(snapView);
-                        if (gridSnapshot == snapView) gridSnapshot = null;
-                    }).start();
+    private void setPinchProgress(float p) {
+        pinchP = p;
+        if (pinchTo == 0) return;
+        float ratio = pinchFrom / (float) pinchTo;
+        if (gridSnapshot != null) {
+            gridSnapshot.setPivotX(pinchFx);
+            gridSnapshot.setPivotY(pinchFy);
+            float s1 = 1f + (ratio - 1f) * p;
+            gridSnapshot.setScaleX(s1);
+            gridSnapshot.setScaleY(s1);
+            gridSnapshot.setAlpha(1f - p);
         }
-        list.setPivotX(fx);
-        list.setPivotY(fy);
-        list.setAlpha(0f);
-        list.setScaleX(1f / ratio);
-        list.setScaleY(1f / ratio);
-        list.animate().alpha(1f).scaleX(1f).scaleY(1f).setDuration(260)
-                .setInterpolator(new android.view.animation.DecelerateInterpolator()).start();
+        list.setPivotX(pinchFx);
+        list.setPivotY(pinchFy);
+        float s2 = 1f / ratio + (1f - 1f / ratio) * p;
+        list.setScaleX(s2);
+        list.setScaleY(s2);
+        list.setAlpha(p);
+    }
+
+    private void commitPinchStep() {
+        prefs.setColumns(pinchTo);
+        gridCols = -1;
+        pinchTo = 0;
+        pinchP = 0f;
+        removeGridSnapshot();
+        resetListTransform();
         list.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK);
+    }
+
+    private void abortPinchStep() {
+        gridCols = -1;
+        pinchTo = 0;
+        pinchP = 0f;
+        rebuildRows();
+        adapter.notifyDataSetChanged();
+        scrollToItem(pinchFirstItem);
+        resetListTransform();
+        removeGridSnapshot();
+    }
+
+    private void resetListTransform() {
+        list.setAlpha(1f);
+        list.setScaleX(1f);
+        list.setScaleY(1f);
+    }
+
+    private void removeGridSnapshot() {
+        if (gridSnapshot == null) return;
+        ((FrameLayout) list.getParent()).removeView(gridSnapshot);
+        gridSnapshot = null;
     }
 
     // ================================================================== copy / move
@@ -1259,6 +1361,9 @@ public class MainActivity extends Activity {
         LinearLayout btns = ui.hbox();
         btns.setGravity(Gravity.END);
         if (problems) btns.addView(ui.flatButton("Show log", v -> { closeOverlay(); pushPage(new LogPage()); }));
+        if (r.fatal == null && (r.copied > 0 || r.skipped > 0)) {
+            btns.addView(ui.flatButton("Show in album", v -> { closeOverlay(); pushPage(DestPicker.browse(this, dest)); }));
+        }
         btns.addView(ui.primaryButton("Done", v -> closeOverlay()));
         LinearLayout.LayoutParams bp = Ui.lp(Ui.MATCH, Ui.WRAP);
         bp.setMargins(0, ui.px(20), 0, 0);
@@ -1476,6 +1581,7 @@ public class MainActivity extends Activity {
                 new AlertDialog.Builder(MainActivity.this).setTitle("Grid columns")
                         .setSingleChoiceItems(opts, prefs.columns() - 2, (d, which) -> {
                             prefs.setColumns(which + 2);
+                            gridCols = -1;
                             applyFilter();
                             refresh();
                             d.dismiss();

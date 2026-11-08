@@ -27,12 +27,14 @@ import java.util.Locale;
  * "Copy here" button. It works inside the top folders granted once in Settings.
  */
 final class DestPicker implements MainActivity.Page {
-    private static final int ALBUM_COLS = 3, PHOTO_COLS = 4, PHOTO_PREVIEW = 48;
+    private static final int ALBUM_COLS = 3, PHOTO_COLS = 4;
 
     private final MainActivity a;
     private final Ui ui;
     private final List<Item> todo;
     private final boolean move;
+    /** Just looking (opened from "Show in album" after a copy): no copy button, more photos shown. */
+    private final boolean browse;
     /** Path from a granted location down to the open album; empty = the start screen. */
     private final List<Prefs.Dest> path = new ArrayList<>();
     private final LinearLayout root, body, crumbs, bottom;
@@ -42,7 +44,23 @@ final class DestPicker implements MainActivity.Page {
     private int token = 0;
 
     DestPicker(MainActivity a, List<Item> todo, boolean move) {
+        this(a, todo, move, false);
+        refresh();
+    }
+
+    /** Opens straight into an album, for looking at what was just copied there. */
+    static DestPicker browse(MainActivity a, Prefs.Dest d) {
+        DestPicker p = new DestPicker(a, new ArrayList<>(), false, true);
+        Prefs.Dest loc = location(d.tree);
+        p.path.add(loc);
+        if (!loc.docId.equals(d.docId)) p.path.add(d);
+        p.refresh();
+        return p;
+    }
+
+    private DestPicker(MainActivity a, List<Item> todo, boolean move, boolean browse) {
         this.a = a;
+        this.browse = browse;
         this.ui = a.ui;
         this.todo = todo;
         this.move = move;
@@ -52,8 +70,8 @@ final class DestPicker implements MainActivity.Page {
 
         root = ui.vbox();
         root.setBackgroundColor(ui.bg);
-        TextView sub = ui.text(what + " · " + Ui.fmtSize(bytes), 13, ui.textDim, false);
-        root.addView(a.pageBar(move ? "Move to album" : "Copy to album", sub), Ui.lp(Ui.MATCH, Ui.WRAP));
+        TextView sub = browse ? null : ui.text(what + " · " + Ui.fmtSize(bytes), 13, ui.textDim, false);
+        root.addView(a.pageBar(browse ? "Albums" : move ? "Move to album" : "Copy to album", sub), Ui.lp(Ui.MATCH, Ui.WRAP));
 
         crumbScroll = new HorizontalScrollView(a);
         crumbScroll.setHorizontalScrollBarEnabled(false);
@@ -76,7 +94,6 @@ final class DestPicker implements MainActivity.Page {
         goBtn = ui.primaryButton((move ? "Move " : "Copy ") + what + " here", v -> go());
         bottom.addView(goBtn, Ui.weight(1));
         root.addView(bottom, Ui.lp(Ui.MATCH, Ui.WRAP));
-        refresh();
     }
 
     @Override public View view() { return root; }
@@ -99,7 +116,7 @@ final class DestPicker implements MainActivity.Page {
         buildCrumbs();
         Prefs.Dest cur = current();
         crumbScroll.setVisibility(cur == null ? View.GONE : View.VISIBLE);
-        bottom.setVisibility(cur == null ? View.GONE : View.VISIBLE);
+        bottom.setVisibility(cur == null || browse ? View.GONE : View.VISIBLE);
         if (cur == null) showStart(); else showAlbum(cur);
     }
 
@@ -309,7 +326,7 @@ final class DestPicker implements MainActivity.Page {
                     return;
                 }
                 List<View> ph = new ArrayList<>();
-                int n = Math.min(PHOTO_PREVIEW, fch.photos.size());
+                int n = Math.min(browse ? 400 : 48, fch.photos.size());
                 for (int i = 0; i < n; i++) {
                     Ui.Square sq = new Ui.Square(a);
                     sq.setBackgroundColor(ui.surface2);
